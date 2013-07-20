@@ -464,7 +464,7 @@ static inline void skb_drop_fraglist(struct sk_buff *skb)
 	skb_drop_list(&skb_shinfo(skb)->frag_list);
 }
 
-static void skb_clone_fraglist(struct sk_buff *skb)
+void skb_clone_fraglist(struct sk_buff *skb)
 {
 	struct sk_buff *list;
 
@@ -882,7 +882,7 @@ static void skb_headers_offset_update(struct sk_buff *skb, int off)
 	skb->inner_mac_header += off;
 }
 
-static void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 {
 #ifndef NET_SKBUFF_DATA_USES_OFFSET
 	/*
