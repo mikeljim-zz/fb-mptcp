@@ -271,6 +271,7 @@
 
 #include <net/icmp.h>
 #include <net/inet_common.h>
+#include <net/mptcp.h>
 #include <net/tcp.h>
 #include <net/xfrm.h>
 #include <net/ip.h>
@@ -604,6 +605,8 @@ static inline void skb_entail(struct sock *sk, struct sk_buff *skb)
 	tcb->seq     = tcb->end_seq = tp->write_seq;
 	tcb->tcp_flags = TCPHDR_ACK;
 	tcb->sacked  = 0;
+	if (tp->mpc)
+		mptcp_skb_entail_init(tp, skb);
 	skb_header_release(skb);
 	tcp_add_write_queue_tail(sk, skb);
 	sk->sk_wmem_queued += skb->truesize;
@@ -829,8 +832,13 @@ static int tcp_send_mss(struct sock *sk, int *size_goal, int flags)
 {
 	int mss_now;
 
-	mss_now = tcp_current_mss(sk);
-	*size_goal = tcp_xmit_size_goal(sk, mss_now, !(flags & MSG_OOB));
+	if (tcp_sk(sk)->mpc) {
+		mss_now = mptcp_current_mss(sk);
+		*size_goal = mptcp_xmit_size_goal(sk, mss_now, !(flags & MSG_OOB));
+	} else {
+		mss_now = tcp_current_mss(sk);
+		*size_goal = tcp_xmit_size_goal(sk, mss_now, !(flags & MSG_OOB));
+	}
 
 	return mss_now;
 }
@@ -852,6 +860,21 @@ static ssize_t do_tcp_sendpages(struct sock *sk, struct page *page, int offset,
 	    !tcp_passive_fastopen(sk)) {
 		if ((err = sk_stream_wait_connect(sk, &timeo)) != 0)
 			goto out_err;
+	}
+
+	if (tp->mpc) {
+		/* We must check this with socket-lock hold because we iterate
+		 * over the subflows.
+		 */
+		if (!mptcp_can_sendpage(sk)) {
+			ssize_t ret;
+
+			release_sock(sk);
+			ret = sock_no_sendpage(sk->sk_socket, page, offset,
+					       size, flags);
+			lock_sock(sk);
+			return ret;
+		}
 	}
 
 	clear_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
@@ -957,8 +980,9 @@ int tcp_sendpage(struct sock *sk, struct page *page, int offset,
 {
 	ssize_t res;
 
-	if (!(sk->sk_route_caps & NETIF_F_SG) ||
-	    !(sk->sk_route_caps & NETIF_F_ALL_CSUM))
+	/* If MPTCP is enabled, we check it later after establishment */
+	if (!tcp_sk(sk)->mpc && (!(sk->sk_route_caps & NETIF_F_SG) ||
+	    !(sk->sk_route_caps & NETIF_F_ALL_CSUM)))
 		return sock_no_sendpage(sk->sk_socket, page, offset, size,
 					flags);
 
@@ -973,6 +997,9 @@ static inline int select_size(const struct sock *sk, bool sg)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	int tmp = tp->mss_cache;
+
+	if (tp->mpc)
+		return mptcp_select_size(sk, sg);
 
 	if (sg) {
 		if (sk_can_gso(sk)) {
@@ -1088,7 +1115,10 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
 		goto out_err;
 
-	sg = !!(sk->sk_route_caps & NETIF_F_SG);
+	if (tp->mpc)
+		sg = mptcp_can_sg(sk);
+	else
+		sg = !!(sk->sk_route_caps & NETIF_F_SG);
 
 	while (--iovlen >= 0) {
 		size_t seglen = iov->iov_len;
@@ -1139,8 +1169,15 @@ new_segment:
 
 				/*
 				 * Check whether we can use HW checksum.
+				 *
+				 * If dss-csum is enabled, we do not do hw-csum.
+				 * In case of non-mptcp we check the
+				 * device-capabilities.
+				 * In case of mptcp, hw-csum's will be handled
+				 * later in mptcp_write_xmit.
 				 */
-				if (sk->sk_route_caps & NETIF_F_ALL_CSUM)
+				if (((tp->mpc && !tp->mpcb->dss_csum) || !tp->mpc) &&
+				    (tp->mpc || sk->sk_route_caps & NETIF_F_ALL_CSUM))
 					skb->ip_summed = CHECKSUM_PARTIAL;
 
 				skb_entail(sk, skb);
@@ -1339,6 +1376,11 @@ void tcp_cleanup_rbuf(struct sock *sk, int copied)
 	bool time_to_ack = false;
 
 	struct sk_buff *skb = skb_peek(&sk->sk_receive_queue);
+
+	if (is_meta_sk(sk)) {
+		mptcp_cleanup_rbuf(sk, copied);
+		return;
+	}
 
 	WARN(skb && !before(tp->copied_seq, TCP_SKB_CB(skb)->end_seq),
 	     "cleanup rbuf bug: copied %X seq %X rcvnxt %X\n",
@@ -2049,8 +2091,12 @@ void tcp_shutdown(struct sock *sk, int how)
 	    (TCPF_ESTABLISHED | TCPF_SYN_SENT |
 	     TCPF_SYN_RECV | TCPF_CLOSE_WAIT)) {
 		/* Clear out any half completed packets.  FIN if needed. */
-		if (tcp_close_state(sk))
-			tcp_send_fin(sk);
+		if (tcp_close_state(sk)) {
+			if (!is_meta_sk(sk))
+				tcp_send_fin(sk);
+			else
+				mptcp_send_fin(sk);
+		}
 	}
 }
 EXPORT_SYMBOL(tcp_shutdown);
@@ -2074,6 +2120,11 @@ void tcp_close(struct sock *sk, long timeout)
 	struct sk_buff *skb;
 	int data_was_unread = 0;
 	int state;
+
+	if (is_meta_sk(sk)) {
+		mptcp_close(sk, timeout);
+		return;
+	}
 
 	lock_sock(sk);
 	sk->sk_shutdown = SHUTDOWN_MASK;
@@ -2280,6 +2331,13 @@ int tcp_disconnect(struct sock *sk, int flags)
 
 	if (!(sk->sk_userlocks & SOCK_BINDADDR_LOCK))
 		inet_reset_saddr(sk);
+
+	if (is_meta_sk(sk)) {
+		mptcp_disconnect(sk);
+	} else {
+		if (tp->inside_tk_table)
+			mptcp_hash_remove_bh(tp);
+	}
 
 	sk->sk_shutdown = 0;
 	sock_reset_flag(sk, SOCK_DONE);
@@ -2636,6 +2694,18 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
 		else
 			tp->tsoffset = val - tcp_time_stamp;
 		break;
+#ifdef CONFIG_MPTCP
+	case MPTCP_ENABLED:
+		if (sk->sk_state == TCP_CLOSE || sk->sk_state == TCP_LISTEN) {
+			if (val)
+				tp->mptcp_enabled = 1;
+			else
+				tp->mptcp_enabled = 0;
+		} else {
+			err = -EPERM;
+		}
+		break;
+#endif
 	default:
 		err = -ENOPROTOOPT;
 		break;
@@ -2852,6 +2922,11 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
 	case TCP_TIMESTAMP:
 		val = tcp_time_stamp + tp->tsoffset;
 		break;
+#ifdef CONFIG_MPTCP
+	case MPTCP_ENABLED:
+		val = tp->mptcp_enabled;
+		break;
+#endif
 	default:
 		return -ENOPROTOOPT;
 	}
@@ -3333,8 +3408,11 @@ void tcp_done(struct sock *sk)
 	if (sk->sk_state == TCP_SYN_SENT || sk->sk_state == TCP_SYN_RECV)
 		TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_ATTEMPTFAILS);
 
+	WARN_ON(sk->sk_state == TCP_CLOSE);
 	tcp_set_state(sk, TCP_CLOSE);
+
 	tcp_clear_xmit_timers(sk);
+
 	if (req != NULL)
 		reqsk_fastopen_remove(sk, req, false);
 
