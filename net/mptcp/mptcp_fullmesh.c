@@ -1,0 +1,552 @@
+#include <linux/module.h>
+
+#include <net/mptcp.h>
+#include <net/mptcp_v4.h>
+
+enum {
+	MPTCP_EVENT_ADD = 1,
+	MPTCP_EVENT_MOD,
+};
+
+struct mptcp_loc_addr {
+	struct mptcp_loc4 locaddr4[MPTCP_MAX_ADDR];
+	u8 loc4_bits;
+	u8 next_v4_index;
+};
+
+struct mptcp_addr_event {
+	struct list_head list;
+	unsigned short	family;
+	u8	code:7;
+	union {
+		struct in_addr addr4;
+	}u;
+};
+
+struct fullmesh_priv {
+	/* Worker struct for subflow establishment */
+	struct work_struct subflow_work;
+	/* Delayed worker, when the routing-tables are not yet ready. */
+	struct delayed_work subflow_retry_work;
+
+	struct mptcp_cb *mpcb;
+
+	u8 announced_addrs_v4; /* IPv4 Addresses we did announce */
+
+	u8	add_addr; /* Are we sending an add_addr? */
+};
+
+struct mptcp_fm_ns {
+	struct mptcp_loc_addr __rcu *local;
+	spinlock_t local_lock; /* Protecting the above pointer */
+	struct list_head events;
+	struct delayed_work address_worker;
+
+	struct net *net;
+};
+
+static struct mptcp_fm_ns *fm_get_ns(struct net *net)
+{
+	return (struct mptcp_fm_ns *)net->mptcp.path_managers[MPTCP_PM_FULLMESH];
+}
+
+static int mptcp_find_address(struct mptcp_loc_addr *mptcp_local,
+			      struct mptcp_addr_event *event)
+{
+	int i;
+	u8 loc_bits;
+	bool found = false;
+
+	if (event->family == AF_INET)
+		loc_bits = mptcp_local->loc4_bits;
+
+	mptcp_for_each_bit_set(loc_bits, i) {
+		if (event->family == AF_INET &&
+		    mptcp_local->locaddr4[i].addr.s_addr == event->u.addr4.s_addr) {
+			found = true;
+			break;
+		}
+	}
+
+	if (!found)
+		return -1;
+
+	return i;
+}
+
+static void mptcp_address_worker(struct work_struct *work)
+{
+	struct delayed_work *delayed_work = container_of(work,
+							 struct delayed_work,
+							 work);
+	struct mptcp_fm_ns *fm_ns = container_of(delayed_work,
+						 struct mptcp_fm_ns,
+						 address_worker);
+	struct net *net = fm_ns->net;
+	struct mptcp_addr_event *event = NULL;
+	struct mptcp_loc_addr *mptcp_local, *old;
+	int i;
+	bool success; /* Used to indicate if we succeeded handling the event */
+
+next_event:
+	success = false;
+	kfree(event);
+
+	/* First, let's dequeue an event from our event-list */
+	rcu_read_lock_bh();
+	spin_lock(&fm_ns->local_lock);
+
+	event = list_first_entry_or_null(&fm_ns->events,
+					 struct mptcp_addr_event, list);
+	if (!event) {
+		spin_unlock(&fm_ns->local_lock);
+		rcu_read_unlock_bh();
+		return;
+	}
+
+	list_del(&event->list);
+
+	mptcp_local = rcu_dereference_bh(fm_ns->local);
+
+{
+		int i = mptcp_find_address(mptcp_local, event);
+		int j = i;
+
+		if (j < 0) {
+			/* Not in the list, so we have to find an empty slot */
+			if (event->family == AF_INET)
+				i = __mptcp_find_free_index(mptcp_local->loc4_bits, 0,
+							    mptcp_local->next_v4_index);
+
+			if (i < 0)
+				goto duno;
+
+			/* It might have been a MOD-event. */
+			event->code = MPTCP_EVENT_ADD;
+		}
+
+		old = mptcp_local;
+		mptcp_local = kmemdup(mptcp_local, sizeof(*mptcp_local),
+				      GFP_ATOMIC);
+		if (!mptcp_local)
+			goto duno;
+
+		if (event->family == AF_INET) {
+			mptcp_local->locaddr4[i].addr.s_addr = event->u.addr4.s_addr;
+			mptcp_local->locaddr4[i].id = i;
+		}
+
+		if (j < 0) {
+			if (event->family == AF_INET) {
+				mptcp_local->loc4_bits |= (1 << i);
+				mptcp_local->next_v4_index = i + 1;
+			}
+		}
+
+		rcu_assign_pointer(fm_ns->local, mptcp_local);
+		kfree(old);
+}
+	success = true;
+
+duno:
+	spin_unlock(&fm_ns->local_lock);
+	rcu_read_unlock_bh();
+
+	if (!success)
+		goto next_event;
+
+	/* Now we iterate over the MPTCP-sockets and apply the event. */
+	for (i = 0; i < MPTCP_HASH_SIZE; i++) {
+		struct hlist_nulls_node *node;
+		struct tcp_sock *meta_tp;
+
+		rcu_read_lock_bh();
+		hlist_nulls_for_each_entry_rcu(meta_tp, node, &tk_hashtable[i],
+					       tk_table) {
+			struct mptcp_cb *mpcb = meta_tp->mpcb;
+			struct sock *meta_sk = (struct sock *)meta_tp, *sk;
+			struct fullmesh_priv *fmp = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
+
+			if (sock_net(meta_sk) != net)
+				continue;
+
+			if (unlikely(!atomic_inc_not_zero(&meta_sk->sk_refcnt)))
+				continue;
+
+			bh_lock_sock(meta_sk);
+
+			if (!meta_tp->mpc || !is_meta_sk(meta_sk) ||
+			    mpcb->infinite_mapping_snd ||
+			    mpcb->infinite_mapping_rcv ||
+			    mpcb->send_infinite_mapping)
+				goto next;
+
+			if (sock_owned_by_user(meta_sk)) {
+				if (!test_and_set_bit(MPTCP_PATH_MANAGER,
+						      &meta_tp->tsq_flags))
+					sock_hold(meta_sk);
+
+				goto next;
+			}
+
+			if (event->code == MPTCP_EVENT_ADD) {
+				if (event->family == AF_INET)
+					fmp->add_addr++;
+
+				sk = mptcp_select_ack_sock(meta_sk, 0);
+				if (sk)
+					tcp_send_ack(sk);
+			}
+next:
+			bh_unlock_sock(meta_sk);
+			sock_put(meta_sk);
+		}
+		rcu_read_unlock_bh();
+	}
+	goto next_event;
+}
+
+static struct mptcp_addr_event *lookup_similar_event(struct net *net,
+						     struct mptcp_addr_event *event)
+{
+	struct mptcp_addr_event *eventq;
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(net);
+
+	list_for_each_entry(eventq, &fm_ns->events, list) {
+		if (eventq->family != event->family)
+			continue;
+		if (event->family == AF_INET) {
+			if (eventq->u.addr4.s_addr == event->u.addr4.s_addr)
+				return eventq;
+		}
+	}
+	return NULL;
+}
+
+/* We already hold the net-namespace MPTCP-lock */
+static void add_pm_event(struct net *net, struct mptcp_addr_event *event)
+{
+	struct mptcp_addr_event *eventq = lookup_similar_event(net, event);
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(net);
+
+	if (eventq) {
+		switch (event->code) {
+		case MPTCP_EVENT_ADD:
+			eventq->code = MPTCP_EVENT_ADD;
+			return;
+		case MPTCP_EVENT_MOD:
+			return;
+		}
+	}
+
+	/* OK, we have to add the new address to the wait queue */
+	eventq = kmemdup(event, sizeof(struct mptcp_addr_event), GFP_ATOMIC);
+	if (!eventq)
+		return;
+
+	list_add_tail(&eventq->list, &fm_ns->events);
+
+	/* Create work-queue */
+	if (!delayed_work_pending(&fm_ns->address_worker))
+		queue_delayed_work(mptcp_wq, &fm_ns->address_worker,
+				   msecs_to_jiffies(500));
+}
+
+static void addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
+				struct net *net)
+{
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(net);
+	struct mptcp_addr_event mpevent;
+
+	if (ifa->ifa_scope > RT_SCOPE_LINK ||
+	    ipv4_is_loopback(ifa->ifa_local))
+		return;
+
+	spin_lock_bh(&fm_ns->local_lock);
+
+	mpevent.family = AF_INET;
+	mpevent.u.addr4.s_addr = ifa->ifa_local;
+
+	if (event == NETDEV_UP)
+		mpevent.code = MPTCP_EVENT_ADD;
+	else if (event == NETDEV_CHANGE)
+		mpevent.code = MPTCP_EVENT_MOD;
+
+	add_pm_event(net, &mpevent);
+
+	spin_unlock_bh(&fm_ns->local_lock);
+	return;
+}
+
+/* React on IPv4-addr add/rem-events */
+static int mptcp_pm_inetaddr_event(struct notifier_block *this,
+				   unsigned long event, void *ptr)
+{
+	struct in_ifaddr *ifa = (struct in_ifaddr *)ptr;
+	struct net *net = dev_net(ifa->ifa_dev->dev);
+
+	addr4_event_handler(ifa, event, net);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block mptcp_pm_inetaddr_notifier = {
+		.notifier_call = mptcp_pm_inetaddr_event,
+};
+
+/* React on ifup/down-events */
+static int netdev_event(struct notifier_block *this, unsigned long event,
+			void *ptr)
+{
+	struct net_device *dev = ptr;
+	struct in_device *in_dev;
+
+	if (!(event == NETDEV_UP || event == NETDEV_DOWN ||
+	      event == NETDEV_CHANGE))
+		return NOTIFY_DONE;
+
+	rcu_read_lock();
+	in_dev = __in_dev_get_rtnl(dev);
+
+	if (in_dev) {
+		for_ifa(in_dev) {
+			mptcp_pm_inetaddr_event(NULL, event, ifa);
+		} endfor_ifa(in_dev);
+	}
+
+	rcu_read_unlock();
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block mptcp_pm_netdev_notifier = {
+		.notifier_call = netdev_event,
+};
+
+static void full_mesh_new_session(struct sock *meta_sk, u8 id)
+{
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct fullmesh_priv *fmp = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
+	struct net *net = sock_net(meta_sk);
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(net);
+	struct sock *sk;
+	int i;
+
+	/* Initialize workqueue-struct */
+	fmp->mpcb = mpcb;
+
+	sk = mptcp_select_ack_sock(meta_sk, 0);
+
+	rcu_read_lock();
+	mptcp_local = rcu_dereference(fm_ns->local);
+
+	/* Look for the address among the local addresses */
+	mptcp_for_each_bit_set(mptcp_local->loc4_bits, i) {
+		__be32 ifa_address = mptcp_local->locaddr4[i].addr.s_addr;
+
+		/* We do not need to announce the initial subflow's address again */
+		if ((meta_sk->sk_family == AF_INET ||
+		     mptcp_v6_is_v4_mapped(meta_sk)) &&
+		    inet_sk(meta_sk)->inet_saddr == ifa_address)
+			continue;
+
+		fmp->add_addr++;
+
+		if (sk)
+			tcp_send_ack(sk);
+	}
+
+	rcu_read_unlock();
+
+	if (meta_sk->sk_family == AF_INET || mptcp_v6_is_v4_mapped(meta_sk))
+		fmp->announced_addrs_v4 |= (1 << id);
+}
+
+static void full_mesh_create_subflows(struct sock *meta_sk)
+{
+}
+
+/* Called upon release_sock, if the socket was owned by the user during
+ * a path-management event.
+ */
+static void full_mesh_release_sock(struct sock *meta_sk)
+{
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct fullmesh_priv *fmp = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(meta_sk));
+	struct sock *sk;
+	int i;
+
+	rcu_read_lock();
+	mptcp_local = rcu_dereference(fm_ns->local);
+
+	/* First, detect modifications or additions */
+	mptcp_for_each_bit_set(mptcp_local->loc4_bits, i) {
+		struct in_addr ifa = mptcp_local->locaddr4[i].addr;
+		bool found = false;
+
+		mptcp_for_each_sk(mpcb, sk) {
+			if (sk->sk_family == AF_INET6 &&
+			    !mptcp_v6_is_v4_mapped(sk))
+				continue;
+
+			if (inet_sk(sk)->inet_saddr != ifa.s_addr)
+				continue;
+
+			found = true;
+		}
+
+		if (!found) {
+			fmp->add_addr++;
+
+			sk = mptcp_select_ack_sock(meta_sk, 0);
+			if (sk)
+				tcp_send_ack(sk);
+		}
+	}
+	rcu_read_unlock();
+}
+
+static int full_mesh_get_local_id(sa_family_t family, union inet_addr *addr,
+				  struct net *net)
+{
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(net);
+	int id = 0, i;
+
+	/* Handle the backup-flows */
+	rcu_read_lock();
+	mptcp_local = rcu_dereference(fm_ns->local);
+
+	if (family == AF_INET) {
+		mptcp_for_each_bit_set(mptcp_local->loc4_bits, i) {
+			if (addr->in.s_addr == mptcp_local->locaddr4[i].addr.s_addr) {
+				id = mptcp_local->locaddr4[i].id;
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+
+	return id;
+}
+
+static int mptcp_fm_init_net(struct net *net)
+{
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_fm_ns *fm_ns;
+
+	fm_ns = kzalloc(sizeof(*fm_ns), GFP_KERNEL);
+	if (!fm_ns)
+		return -ENOBUFS;
+
+	mptcp_local = kzalloc(sizeof(*mptcp_local), GFP_KERNEL);
+	if (!mptcp_local) {
+		kfree(fm_ns);
+		return -ENOBUFS;
+	}
+
+	mptcp_local->next_v4_index = 1;
+
+	rcu_assign_pointer(fm_ns->local, mptcp_local);
+	INIT_DELAYED_WORK(&fm_ns->address_worker, mptcp_address_worker);
+	INIT_LIST_HEAD(&fm_ns->events);
+	spin_lock_init(&fm_ns->local_lock);
+	fm_ns->net = net;
+	net->mptcp.path_managers[MPTCP_PM_FULLMESH] = fm_ns;
+
+	return 0;
+}
+
+static void mptcp_fm_exit_net(struct net *net)
+{
+	struct mptcp_addr_event *eventq, *tmp;
+	struct mptcp_fm_ns *fm_ns;
+	struct mptcp_loc_addr *mptcp_local;
+
+	fm_ns = fm_get_ns(net);
+	cancel_delayed_work_sync(&fm_ns->address_worker);
+
+	rcu_read_lock_bh();
+
+	mptcp_local = rcu_dereference_bh(fm_ns->local);
+	kfree(mptcp_local);
+
+	spin_lock(&fm_ns->local_lock);
+	list_for_each_entry_safe(eventq, tmp, &fm_ns->events, list) {
+		list_del(&eventq->list);
+		kfree(eventq);
+	}
+	spin_unlock(&fm_ns->local_lock);
+
+	rcu_read_unlock_bh();
+
+	kfree(fm_ns);
+}
+
+static struct pernet_operations full_mesh_net_ops = {
+	.init = mptcp_fm_init_net,
+	.exit = mptcp_fm_exit_net,
+};
+
+static struct mptcp_pm_ops full_mesh __read_mostly = {
+	.new_session = full_mesh_new_session,
+	.release_sock = full_mesh_release_sock,
+	.fully_established = full_mesh_create_subflows,
+	.new_remote_address = full_mesh_create_subflows,
+	.get_local_id = full_mesh_get_local_id,
+	.name = "fullmesh",
+	.owner = THIS_MODULE,
+};
+
+/* General initialization of MPTCP_PM */
+static int __init full_mesh_register(void)
+{
+	int ret;
+
+	BUILD_BUG_ON(sizeof(struct fullmesh_priv) > MPTCP_PM_SIZE);
+
+	ret = register_pernet_subsys(&full_mesh_net_ops);
+	if (ret)
+		goto out;
+
+	ret = register_inetaddr_notifier(&mptcp_pm_inetaddr_notifier);
+	if (ret)
+		goto err_reg_inetaddr;
+	ret = register_netdevice_notifier(&mptcp_pm_netdev_notifier);
+	if (ret)
+		goto err_reg_netdev;
+
+	ret = mptcp_register_path_manager(&full_mesh);
+	if (ret)
+		goto err_reg_pm;
+
+out:
+	return ret;
+
+
+err_reg_pm:
+	unregister_netdevice_notifier(&mptcp_pm_netdev_notifier);
+err_reg_netdev:
+	unregister_inetaddr_notifier(&mptcp_pm_inetaddr_notifier);
+err_reg_inetaddr:
+	unregister_pernet_subsys(&full_mesh_net_ops);
+	goto out;
+}
+
+static void full_mesh_unregister(void)
+{
+	unregister_netdevice_notifier(&mptcp_pm_netdev_notifier);
+	unregister_inetaddr_notifier(&mptcp_pm_inetaddr_notifier);
+	unregister_pernet_subsys(&full_mesh_net_ops);
+	mptcp_unregister_path_manager(&full_mesh);
+}
+
+module_init(full_mesh_register);
+module_exit(full_mesh_unregister);
+
+MODULE_AUTHOR("Christoph Paasch");
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Full-Mesh MPTCP");
+MODULE_VERSION("0.88");
