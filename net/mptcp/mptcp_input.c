@@ -31,6 +31,7 @@
 
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
+#include <net/mptcp_v6.h>
 
 #include <linux/kconfig.h>
 
@@ -1063,8 +1064,14 @@ int mptcp_check_req(struct sk_buff *skb, struct net *net)
 	if (mptcp_init_failed)
 		return 0;
 
-	meta_sk = mptcp_v4_search_req(th->source, ip_hdr(skb)->saddr,
-				      ip_hdr(skb)->daddr, net);
+	if (skb->protocol == htons(ETH_P_IP))
+		meta_sk = mptcp_v4_search_req(th->source, ip_hdr(skb)->saddr,
+					      ip_hdr(skb)->daddr, net);
+#if IS_ENABLED(CONFIG_IPV6)
+	else /* IPv6 */
+		meta_sk = mptcp_v6_search_req(th->source, &ipv6_hdr(skb)->saddr,
+					      &ipv6_hdr(skb)->daddr, net);
+#endif /* CONFIG_IPV6 */
 
 	if (!meta_sk)
 		return 0;
@@ -1082,8 +1089,12 @@ int mptcp_check_req(struct sk_buff *skb, struct net *net)
 			kfree_skb(skb);
 			return 1;
 		}
-	} else {
+	} else if (skb->protocol == htons(ETH_P_IP)) {
 		tcp_v4_do_rcv(meta_sk, skb);
+#if IS_ENABLED(CONFIG_IPV6)
+	} else { /* IPv6 */
+		tcp_v6_do_rcv(meta_sk, skb);
+#endif /* CONFIG_IPV6 */
 	}
 	bh_unlock_sock(meta_sk);
 	sock_put(meta_sk); /* Taken by mptcp_vX_search_req */
@@ -1179,8 +1190,12 @@ int mptcp_lookup_join(struct sk_buff *skb, struct inet_timewait_sock *tw)
 			kfree_skb(skb);
 			return 1;
 		}
-	} else {
+	} else if (skb->protocol == htons(ETH_P_IP)) {
 		tcp_v4_do_rcv(meta_sk, skb);
+#if IS_ENABLED(CONFIG_IPV6)
+	} else {
+		tcp_v6_do_rcv(meta_sk, skb);
+#endif /* CONFIG_IPV6 */
 	}
 	bh_unlock_sock(meta_sk);
 	sock_put(meta_sk); /* Taken by mptcp_hash_find */
@@ -1238,7 +1253,13 @@ int mptcp_do_join_short(struct sk_buff *skb, struct mptcp_options_received *mopt
 		 * coming from)
 		 */
 		skb_get(skb);
-		tcp_v4_do_rcv(meta_sk, skb);
+		if (skb->protocol == htons(ETH_P_IP)) {
+			tcp_v4_do_rcv(meta_sk, skb);
+#if IS_ENABLED(CONFIG_IPV6)
+		} else { /* IPv6 */
+			tcp_v6_do_rcv(meta_sk, skb);
+#endif /* CONFIG_IPV6 */
+		}
 	}
 
 	bh_unlock_sock(meta_sk);
@@ -1511,8 +1532,14 @@ void mptcp_clean_rtx_infinite(struct sk_buff *skb, struct sock *sk)
 
 static inline int mptcp_rem_raddress(struct mptcp_cb *mpcb, u8 rem_id)
 {
-	if (mptcp_v4_rem_raddress(mpcb, rem_id) < 0)
+	if (mptcp_v4_rem_raddress(mpcb, rem_id) < 0) {
+#if IS_ENABLED(CONFIG_IPV6)
+		if (mptcp_v6_rem_raddress(mpcb, rem_id) < 0)
+			return -1;
+#else
 		return -1;
+#endif /* CONFIG_IPV6 */
+	}
 	return 0;
 }
 
@@ -1689,8 +1716,17 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 	}
 	case MPTCP_SUB_ADD_ADDR:
 	{
+#if IS_ENABLED(CONFIG_IPV6)
+		struct mp_add_addr *mpadd = (struct mp_add_addr *)ptr;
+
+		if ((mpadd->ipver == 4 && opsize != MPTCP_SUB_LEN_ADD_ADDR4 &&
+		     opsize != MPTCP_SUB_LEN_ADD_ADDR4 + 2) ||
+		    (mpadd->ipver == 6 && opsize != MPTCP_SUB_LEN_ADD_ADDR6 &&
+		     opsize != MPTCP_SUB_LEN_ADD_ADDR6 + 2)) {
+#else
 		if (opsize != MPTCP_SUB_LEN_ADD_ADDR4 &&
 		    opsize != MPTCP_SUB_LEN_ADD_ADDR4 + 2) {
+#endif /* CONFIG_IPV6 */
 			mptcp_debug("%s: mp_add_addr: bad option size %d\n",
 				    __func__, opsize);
 			break;
@@ -1798,6 +1834,15 @@ static void mptcp_handle_add_addr(const unsigned char *ptr, struct sock *sk)
 
 		mptcp_v4_add_raddress(tcp_sk(sk)->mpcb, &mpadd->u.v4.addr, port,
 				      mpadd->addr_id);
+#if IS_ENABLED(CONFIG_IPV6)
+	} else if (mpadd->ipver == 6) {
+		__be16 port = 0;
+		if (mpadd->len == MPTCP_SUB_LEN_ADD_ADDR6 + 2)
+			port  = mpadd->u.v6.port;
+
+		mptcp_v6_add_raddress(tcp_sk(sk)->mpcb, &mpadd->u.v6.addr, port,
+				      mpadd->addr_id);
+#endif /* CONFIG_IPV6 */
 	}
 }
 
@@ -1840,8 +1885,16 @@ static void mptcp_parse_addropt(const struct sk_buff *skb, struct sock *sk)
 				return;  /* don't parse partial options */
 			if (opcode == TCPOPT_MPTCP &&
 			    ((struct mptcp_option *)ptr)->sub == MPTCP_SUB_ADD_ADDR) {
+#if IS_ENABLED(CONFIG_IPV6)
+				struct mp_add_addr *mpadd = (struct mp_add_addr *)ptr;
+				if ((mpadd->ipver == 4 && opsize != MPTCP_SUB_LEN_ADD_ADDR4 &&
+				     opsize != MPTCP_SUB_LEN_ADD_ADDR4 + 2) ||
+				    (mpadd->ipver == 6 && opsize != MPTCP_SUB_LEN_ADD_ADDR6 &&
+				     opsize != MPTCP_SUB_LEN_ADD_ADDR6 + 2))
+#else
 				if (opsize != MPTCP_SUB_LEN_ADD_ADDR4 &&
 				    opsize != MPTCP_SUB_LEN_ADD_ADDR4 + 2)
+#endif /* CONFIG_IPV6 */
 					goto cont;
 
 				mptcp_handle_add_addr(ptr, sk);

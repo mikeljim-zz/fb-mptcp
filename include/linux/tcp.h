@@ -84,7 +84,8 @@ struct tcp_out_options {
 #ifdef CONFIG_MPTCP
 	u16	mptcp_options;	/* bit field of MPTCP related OPTION_* */
 	u8	dss_csum:1,
-		add_addr_v4:1;
+		add_addr_v4:1,
+		add_addr_v6:1;	/* dss-checksum required? */
 
 	__u32	data_seq;	/* data sequence number, for MPTCP */
 	__u32	data_ack;	/* data ack, for MPTCP */
@@ -107,6 +108,11 @@ struct tcp_out_options {
 		struct in_addr addr;
 		u8 addr_id;
 	} add_addr4;
+
+	struct {
+		struct in6_addr addr;
+		u8 addr_id;
+	} add_addr6;
 
 	u16	remove_addrs;	/* list of address id */
 	u8	addr_id;	/* address id (mp_join or add_address) */

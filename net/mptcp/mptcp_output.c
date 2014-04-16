@@ -33,6 +33,7 @@
 
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
+#include <net/mptcp_v6.h>
 #include <net/sock.h>
 
 static inline int mptcp_pi_to_flag(int pi)
@@ -1552,6 +1553,14 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 			mpadd->addr_id = opts->add_addr4.addr_id;
 			mpadd->u.v4.addr = opts->add_addr4.addr;
 			ptr += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN >> 2;
+		} else if (opts->add_addr_v6) {
+			mpadd->len = MPTCP_SUB_LEN_ADD_ADDR6;
+			mpadd->sub = MPTCP_SUB_ADD_ADDR;
+			mpadd->ipver = 6;
+			mpadd->addr_id = opts->add_addr6.addr_id;
+			memcpy(&mpadd->u.v6.addr, &opts->add_addr6.addr,
+			       sizeof(mpadd->u.v6.addr));
+			ptr += MPTCP_SUB_LEN_ADD_ADDR6_ALIGN >> 2;
 		}
 	}
 	if (unlikely(OPTION_REMOVE_ADDR & opts->mptcp_options)) {

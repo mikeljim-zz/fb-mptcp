@@ -3,6 +3,10 @@
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
 
+#if IS_ENABLED(CONFIG_IPV6)
+#include <net/mptcp_v6.h>
+#endif
+
 struct ndiffports_priv {
 	/* Worker struct for subflow establishment */
 	struct work_struct subflow_work;
@@ -58,6 +62,16 @@ next_subflow:
 			loc.low_prio = 0;
 
 			mptcp_init4_subsockets(meta_sk, &loc, &mpcb->remaddr4[0]);
+		} else {
+#if IS_ENABLED(CONFIG_IPV6)
+			struct mptcp_loc6 loc;
+
+			loc.addr = inet6_sk(meta_sk)->saddr;
+			loc.id = 0;
+			loc.low_prio = 0;
+
+			mptcp_init6_subsockets(meta_sk, &loc, &mpcb->remaddr6[0]);
+#endif
 		}
 		goto next_subflow;
 	}

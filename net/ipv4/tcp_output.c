@@ -38,6 +38,10 @@
 
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
+#if IS_ENABLED(CONFIG_IPV6) 
+#include <net/mptcp_v6.h>
+#endif
+#include <net/ipv6.h>
 #include <net/tcp.h>
 
 #include <linux/compiler.h>
@@ -2986,12 +2990,22 @@ void tcp_connect_init(struct sock *sk)
 			tp->mptcp->init_rcv_wnd	= tp->rcv_wnd;
 
 			/* Set nonce for new subflows */
-			tp->mptcp->mptcp_loc_nonce = mptcp_v4_get_nonce(
+			if (sk->sk_family == AF_INET)
+				tp->mptcp->mptcp_loc_nonce = mptcp_v4_get_nonce(
 							inet->inet_saddr,
 							inet->inet_daddr,
 							inet->inet_sport,
 							inet->inet_dport,
 							tp->write_seq);
+#if IS_ENABLED(CONFIG_IPV6)
+			else
+				tp->mptcp->mptcp_loc_nonce = mptcp_v6_get_nonce(
+						inet6_sk(sk)->saddr.s6_addr32,
+						inet6_sk(sk)->daddr.s6_addr32,
+						inet->inet_sport,
+						inet->inet_dport,
+						tp->write_seq);
+#endif
 		}
 	}
 #endif

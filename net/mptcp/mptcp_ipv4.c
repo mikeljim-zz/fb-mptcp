@@ -38,6 +38,7 @@
 #include <net/inet_connection_sock.h>
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
+#include <net/mptcp_v6.h>
 #include <net/request_sock.h>
 #include <net/tcp.h>
 

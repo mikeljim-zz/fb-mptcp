@@ -3,6 +3,11 @@
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
 
+#if IS_ENABLED(CONFIG_IPV6)
+#include <net/mptcp_v6.h>
+#include <net/addrconf.h>
+#endif
+
 enum {
 	MPTCP_EVENT_ADD = 1,
 	MPTCP_EVENT_DEL,
@@ -13,6 +18,10 @@ struct mptcp_loc_addr {
 	struct mptcp_loc4 locaddr4[MPTCP_MAX_ADDR];
 	u8 loc4_bits;
 	u8 next_v4_index;
+
+	struct mptcp_loc6 locaddr6[MPTCP_MAX_ADDR];
+	u8 loc6_bits;
+	u8 next_v6_index;
 };
 
 struct mptcp_addr_event {
@@ -22,6 +31,7 @@ struct mptcp_addr_event {
 		low_prio:1;
 	union {
 		struct in_addr addr4;
+		struct in6_addr addr6;
 	}u;
 };
 
@@ -35,6 +45,7 @@ struct fullmesh_priv {
 
 	u16 remove_addrs; /* Addresses to remove */
 	u8 announced_addrs_v4; /* IPv4 Addresses we did announce */
+	u8 announced_addrs_v6; /* IPv4 Addresses we did announce */
 
 	u8	add_addr; /* Are we sending an add_addr? */
 };
@@ -105,6 +116,20 @@ next_subflow:
 			goto next_subflow;
 		}
 	}
+
+#if IS_ENABLED(CONFIG_IPV6)
+	mptcp_for_each_bit_set(mpcb->rem6_bits, i) {
+		struct mptcp_rem6 *rem = &mpcb->remaddr6[i];
+
+		/* Do we need to retry establishing a subflow ? */
+		if (rem->retry_bitfield) {
+			int i = mptcp_find_free_index(~rem->retry_bitfield);
+			mptcp_init6_subsockets(meta_sk, &mptcp_local->locaddr6[i], rem);
+			rem->retry_bitfield &= ~(1 << i);
+			goto next_subflow;
+		}
+	}
+#endif
 
 	kfree(mptcp_local);
 
@@ -181,6 +206,26 @@ next_subflow:
 		}
 	}
 
+#if IS_ENABLED(CONFIG_IPV6)
+	mptcp_for_each_bit_set(mpcb->rem6_bits, i) {
+		struct mptcp_rem6 *rem;
+		u8 remaining_bits;
+
+		rem = &mpcb->remaddr6[i];
+		remaining_bits = ~(rem->bitfield) & mptcp_local->loc6_bits;
+
+		/* Are there still combinations to handle? */
+		if (remaining_bits) {
+			int i = mptcp_find_free_index(~remaining_bits);
+			/* If a route is not yet available then retry once */
+			if (mptcp_init6_subsockets(meta_sk, &mptcp_local->locaddr6[i],
+						   rem) == -ENETUNREACH)
+				retry = rem->retry_bitfield |= (1 << i);
+			goto next_subflow;
+		}
+	}
+#endif
+
 	if (retry && !delayed_work_pending(&pm_priv->subflow_retry_work)) {
 		sock_hold(meta_sk);
 		queue_delayed_work(mptcp_wq, &pm_priv->subflow_retry_work,
@@ -211,6 +256,13 @@ static void update_remove_addrs(u8 addr_id, struct sock *meta_sk,
 			mpcb->remaddr4[i].bitfield &= mptcp_local->loc4_bits;
 			mpcb->remaddr4[i].retry_bitfield &= mptcp_local->loc4_bits;
 		}
+	} else {
+		fmp->announced_addrs_v6 &= ~(1 << (addr_id - MPTCP_MAX_ADDR));
+
+		mptcp_for_each_bit_set(mpcb->rem6_bits, i) {
+			mpcb->remaddr6[i].bitfield &= mptcp_local->loc6_bits;
+			mpcb->remaddr6[i].retry_bitfield &= mptcp_local->loc6_bits;
+		}
 	}
 
 	sk = mptcp_select_ack_sock(meta_sk, 0);
@@ -227,10 +279,18 @@ static int mptcp_find_address(struct mptcp_loc_addr *mptcp_local,
 
 	if (event->family == AF_INET)
 		loc_bits = mptcp_local->loc4_bits;
+	else
+		loc_bits = mptcp_local->loc6_bits;
 
 	mptcp_for_each_bit_set(loc_bits, i) {
 		if (event->family == AF_INET &&
 		    mptcp_local->locaddr4[i].addr.s_addr == event->u.addr4.s_addr) {
+			found = true;
+			break;
+		}
+		if (event->family == AF_INET6 &&
+		    ipv6_addr_equal(&mptcp_local->locaddr6[i].addr,
+				    &event->u.addr6)) {
 			found = true;
 			break;
 		}
@@ -291,6 +351,8 @@ next_event:
 
 		if (event->family == AF_INET)
 			mptcp_local->loc4_bits &= ~(1 << id);
+		else
+			mptcp_local->loc6_bits &= ~(1 << id);
 
 		rcu_assign_pointer(fm_ns->local, mptcp_local);
 		kfree(old);
@@ -303,6 +365,9 @@ next_event:
 			if (event->family == AF_INET)
 				i = __mptcp_find_free_index(mptcp_local->loc4_bits, 0,
 							    mptcp_local->next_v4_index);
+			if (event->family == AF_INET6)
+				i = __mptcp_find_free_index(mptcp_local->loc6_bits, 0,
+							    mptcp_local->next_v6_index);
 
 			if (i < 0)
 				goto duno;
@@ -313,6 +378,10 @@ next_event:
 			/* Let's check if anything changes */
 			if (event->family == AF_INET && 
 			    event->low_prio == mptcp_local->locaddr4[i].low_prio)
+				goto duno;
+
+			if (event->family == AF_INET6 && 
+			    event->low_prio == mptcp_local->locaddr6[i].low_prio)
 				goto duno;
 		}
 
@@ -326,12 +395,19 @@ next_event:
 			mptcp_local->locaddr4[i].addr.s_addr = event->u.addr4.s_addr;
 			mptcp_local->locaddr4[i].id = i;
 			mptcp_local->locaddr4[i].low_prio = event->low_prio;
+		} else {
+			mptcp_local->locaddr6[i].addr = event->u.addr6;
+			mptcp_local->locaddr6[i].id = i + MPTCP_MAX_ADDR;
+			mptcp_local->locaddr6[i].low_prio = event->low_prio;
 		}
 
 		if (j < 0) {
 			if (event->family == AF_INET) {
 				mptcp_local->loc4_bits |= (1 << i);
 				mptcp_local->next_v4_index = i + 1;
+			} else {
+				mptcp_local->loc6_bits |= (1 << i);
+				mptcp_local->next_v6_index = i + 1;
 			}
 		}
 
@@ -384,6 +460,10 @@ duno:
 			if (event->code == MPTCP_EVENT_ADD) {
 				if (event->family == AF_INET)
 					fmp->add_addr++;
+#if IS_ENABLED(CONFIG_IPV6)
+				if (event->family == AF_INET6)
+					fmp->add_addr++;
+#endif
 
 				sk = mptcp_select_ack_sock(meta_sk, 0);
 				if (sk)
@@ -413,6 +493,11 @@ duno:
 					    (sk->sk_family == AF_INET ||
 					     mptcp_v6_is_v4_mapped(sk)) &&
 					     inet_sk(sk)->inet_saddr != event->u.addr4.s_addr)
+						continue;
+
+					if (event->family == AF_INET6 &&
+					    sk->sk_family == AF_INET6 &&
+					    !ipv6_addr_equal(&inet6_sk(sk)->saddr, &event->u.addr6))
 						continue;
 
 					/* Reinject, so that pf = 1 and so we
@@ -462,6 +547,17 @@ duno:
 							tcp_send_ack(sk);
 						}
 					}
+
+					if (event->family == AF_INET6 &&
+					    sk->sk_family == AF_INET6 &&
+					    !ipv6_addr_equal(&inet6_sk(sk)->saddr, &event->u.addr6)) {
+						if (event->low_prio != tp->mptcp->low_prio) {
+							tp->mptcp->send_mp_prio = 1;
+							tp->mptcp->low_prio = event->low_prio;
+
+							tcp_send_ack(sk);
+						}
+					}
 				}
 			}
 next:
@@ -484,6 +580,9 @@ static struct mptcp_addr_event *lookup_similar_event(struct net *net,
 			continue;
 		if (event->family == AF_INET) {
 			if (eventq->u.addr4.s_addr == event->u.addr4.s_addr)
+				return eventq;
+		} else {
+			if (ipv6_addr_equal(&eventq->u.addr6, &event->u.addr6))
 				return eventq;
 		}
 	}
@@ -572,12 +671,129 @@ static struct notifier_block mptcp_pm_inetaddr_notifier = {
 		.notifier_call = mptcp_pm_inetaddr_event,
 };
 
+#if IS_ENABLED(CONFIG_IPV6)
+
+/* IPV6-related address/interface watchers */
+struct mptcp_dad_data {
+	struct timer_list timer;
+	struct inet6_ifaddr *ifa;
+};
+
+static void dad_callback(unsigned long arg);
+static int inet6_addr_event(struct notifier_block *this,
+				     unsigned long event, void *ptr);
+
+static int ipv6_is_in_dad_state(struct inet6_ifaddr *ifa)
+{
+	return ((ifa->flags & IFA_F_TENTATIVE) &&
+		ifa->state == INET6_IFADDR_STATE_DAD);
+}
+
+static void dad_init_timer(struct mptcp_dad_data *data,
+				 struct inet6_ifaddr *ifa)
+{
+	data->ifa = ifa;
+	data->timer.data = (unsigned long)data;
+	data->timer.function = dad_callback;
+	if (ifa->idev->cnf.rtr_solicit_delay)
+		data->timer.expires = jiffies + ifa->idev->cnf.rtr_solicit_delay;
+	else
+		data->timer.expires = jiffies + (HZ/10);
+}
+
+static void dad_callback(unsigned long arg)
+{
+	struct mptcp_dad_data *data = (struct mptcp_dad_data *)arg;
+
+	if (ipv6_is_in_dad_state(data->ifa)) {
+		dad_init_timer(data, data->ifa);
+		add_timer(&data->timer);
+	} else {
+		inet6_addr_event(NULL, NETDEV_UP, data->ifa);
+		in6_ifa_put(data->ifa);
+		kfree(data);
+	}
+}
+
+static inline void dad_setup_timer(struct inet6_ifaddr *ifa)
+{
+	struct mptcp_dad_data *data;
+
+	data = kmalloc(sizeof(*data), GFP_ATOMIC);
+
+	if (!data)
+		return;
+
+	init_timer(&data->timer);
+	dad_init_timer(data, ifa);
+	add_timer(&data->timer);
+	in6_ifa_hold(ifa);
+}
+
+static void addr6_event_handler(struct inet6_ifaddr *ifa, unsigned long event,
+				struct net *net)
+{
+	struct net_device *netdev = ifa->idev->dev;
+	int addr_type = ipv6_addr_type(&ifa->addr);
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(net);
+	struct mptcp_addr_event mpevent;
+
+	if (ifa->scope > RT_SCOPE_LINK ||
+	    addr_type == IPV6_ADDR_ANY ||
+	    (addr_type & IPV6_ADDR_LOOPBACK) ||
+	    (addr_type & IPV6_ADDR_LINKLOCAL))
+		return;
+
+	spin_lock_bh(&fm_ns->local_lock);
+
+	mpevent.family = AF_INET6;
+	mpevent.u.addr6 = ifa->addr;
+	mpevent.low_prio = (netdev->flags & IFF_MPBACKUP) ? 1 : 0;
+
+	if (event == NETDEV_DOWN ||!netif_running(netdev) ||
+	    (netdev->flags & IFF_NOMULTIPATH))
+		mpevent.code = MPTCP_EVENT_DEL;
+	else if (event == NETDEV_UP)
+		mpevent.code = MPTCP_EVENT_ADD;
+	else if (event == NETDEV_CHANGE)
+		mpevent.code = MPTCP_EVENT_MOD;
+
+	add_pm_event(net, &mpevent);
+
+	spin_unlock_bh(&fm_ns->local_lock);
+	return;
+}
+
+/* React on IPv6-addr add/rem-events */
+static int inet6_addr_event(struct notifier_block *this, unsigned long event,
+			    void *ptr)
+{
+	struct inet6_ifaddr *ifa6 = (struct inet6_ifaddr *)ptr;
+	struct net *net = dev_net(ifa6->idev->dev);
+
+	if (ipv6_is_in_dad_state(ifa6))
+		dad_setup_timer(ifa6);
+	else
+		addr6_event_handler(ifa6, event, net);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block inet6_addr_notifier = {
+		.notifier_call = inet6_addr_event,
+};
+
+#endif
+
 /* React on ifup/down-events */
 static int netdev_event(struct notifier_block *this, unsigned long event,
 			void *ptr)
 {
 	struct net_device *dev = ptr;
 	struct in_device *in_dev;
+#if IS_ENABLED(CONFIG_IPV6)
+	struct inet6_dev *in6_dev;
+#endif
 
 	if (!(event == NETDEV_UP || event == NETDEV_DOWN ||
 	      event == NETDEV_CHANGE))
@@ -591,6 +807,16 @@ static int netdev_event(struct notifier_block *this, unsigned long event,
 			mptcp_pm_inetaddr_event(NULL, event, ifa);
 		} endfor_ifa(in_dev);
 	}
+
+#if IS_ENABLED(CONFIG_IPV6)
+	in6_dev = __in6_dev_get(dev);
+
+	if (in6_dev) {
+		struct inet6_ifaddr *ifa6;
+		list_for_each_entry(ifa6, &in6_dev->addr_list, if_list)
+			inet6_addr_event(NULL, event, ifa6);
+	}
+#endif
 
 	rcu_read_unlock();
 	return NOTIFY_DONE;
@@ -636,10 +862,28 @@ static void full_mesh_new_session(struct sock *meta_sk, u8 id)
 			tcp_send_ack(sk);
 	}
 
+#if IS_ENABLED(CONFIG_IPV6)
+	mptcp_for_each_bit_set(mptcp_local->loc6_bits, i) {
+		struct in6_addr *ifa6 = &mptcp_local->locaddr6[i].addr;
+
+		/* We do not need to announce the initial subflow's address again */
+		if (meta_sk->sk_family == AF_INET6 &&
+		    ipv6_addr_equal(&inet6_sk(meta_sk)->saddr, ifa6))
+			continue;
+
+		fmp->add_addr++;
+
+		if (sk)
+			tcp_send_ack(sk);
+	}
+#endif
+
 	rcu_read_unlock();
 
 	if (meta_sk->sk_family == AF_INET || mptcp_v6_is_v4_mapped(meta_sk))
 		fmp->announced_addrs_v4 |= (1 << id);
+	else
+		fmp->announced_addrs_v6 |= (1 << (id - MPTCP_MAX_ADDR));
 }
 
 static void full_mesh_create_subflows(struct sock *meta_sk)
@@ -716,6 +960,42 @@ static void full_mesh_release_sock(struct sock *meta_sk)
 		}
 	}
 
+#if IS_ENABLED(CONFIG_IPV6)
+	mptcp_for_each_bit_set(mptcp_local->loc6_bits, i) {
+		struct in6_addr ifa = mptcp_local->locaddr6[i].addr;
+		bool found = false;
+
+		mptcp_for_each_sk(mpcb, sk) {
+			struct tcp_sock *tp = tcp_sk(sk);
+
+			if (sk->sk_family == AF_INET ||
+			    mptcp_v6_is_v4_mapped(sk))
+				continue;
+
+			if (!ipv6_addr_equal(&inet6_sk(sk)->saddr, &ifa))
+				continue;
+
+			found = true;
+
+			if (mptcp_local->locaddr6[i].low_prio != tp->mptcp->low_prio) {
+				tp->mptcp->send_mp_prio = 1;
+				tp->mptcp->low_prio = mptcp_local->locaddr6[i].low_prio;
+
+				tcp_send_ack(sk);
+			}
+		}
+
+		if (!found) {
+			fmp->add_addr++;
+
+			sk = mptcp_select_ack_sock(meta_sk, 0);
+			if (sk)
+				tcp_send_ack(sk);
+			full_mesh_create_subflows(meta_sk);
+		}
+	}
+#endif
+
 	/* Now, detect address-removals */
 	mptcp_for_each_sk_safe(mpcb, sk, tmpsk) {
 		bool shall_remove = true;
@@ -723,6 +1003,13 @@ static void full_mesh_release_sock(struct sock *meta_sk)
 		if (sk->sk_family == AF_INET || mptcp_v6_is_v4_mapped(sk)) {
 			mptcp_for_each_bit_set(mptcp_local->loc4_bits, i) {
 				if (inet_sk(sk)->inet_saddr == mptcp_local->locaddr4[i].addr.s_addr) {
+					shall_remove = false;
+					break;
+				}
+			}
+		} else {
+			mptcp_for_each_bit_set(mptcp_local->loc6_bits, i) {
+				if (ipv6_addr_equal(&inet6_sk(sk)->saddr, &mptcp_local->locaddr6[i].addr)) {
 					shall_remove = false;
 					break;
 				}
@@ -766,6 +1053,13 @@ static int full_mesh_get_local_id(sa_family_t family, union inet_addr *addr,
 				break;
 			}
 		}
+	} else {
+		mptcp_for_each_bit_set(mptcp_local->loc6_bits, i) {
+			if (ipv6_addr_equal(&addr->in6, &mptcp_local->locaddr6[i].addr)) {
+				id = mptcp_local->locaddr6[i].id;
+				break;
+			}
+		}
 	}
 	rcu_read_unlock();
 
@@ -782,7 +1076,7 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 	struct mptcp_loc_addr *mptcp_local;
 	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(sk));
 	int remove_addr_len;
-	u8 unannouncedv4;
+	u8 unannouncedv4, unannouncedv6;
 
 	if (likely(!fmp->add_addr))
 		goto remove_addr;
@@ -809,9 +1103,28 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 		*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN;
 	}
 
+	/* IPv6 */
+	unannouncedv6 = (~fmp->announced_addrs_v6) & mptcp_local->loc6_bits;
+	if (unannouncedv6 &&
+	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR6_ALIGN) {
+		int ind = mptcp_find_free_index(~unannouncedv6);
+
+		opts->options |= OPTION_MPTCP;
+		opts->mptcp_options |= OPTION_ADD_ADDR;
+		opts->add_addr6.addr_id = mptcp_local->locaddr6[ind].id;
+		opts->add_addr6.addr = mptcp_local->locaddr6[ind].addr;
+		opts->add_addr_v6 = 1;
+
+		if (skb) {
+			fmp->announced_addrs_v6 |= (1 << ind);
+			fmp->add_addr--;
+		}
+		*size += MPTCP_SUB_LEN_ADD_ADDR6_ALIGN;
+	}
+
 	rcu_read_unlock();
 
-	if (!unannouncedv4 && skb) {
+	if (!unannouncedv4 && !unannouncedv6 && skb) {
 		fmp->add_addr--;
 	}
 
@@ -918,6 +1231,12 @@ static int __init full_mesh_register(void)
 	if (ret)
 		goto err_reg_netdev;
 
+#if IS_ENABLED(CONFIG_IPV6)
+	ret = register_inet6addr_notifier(&inet6_addr_notifier);
+	if (ret)
+		goto err_reg_inet6addr;
+#endif
+
 	ret = mptcp_register_path_manager(&full_mesh);
 	if (ret)
 		goto err_reg_pm;
@@ -927,6 +1246,10 @@ out:
 
 
 err_reg_pm:
+#if IS_ENABLED(CONFIG_IPV6)
+	unregister_inet6addr_notifier(&inet6_addr_notifier);
+err_reg_inet6addr:
+#endif
 	unregister_netdevice_notifier(&mptcp_pm_netdev_notifier);
 err_reg_netdev:
 	unregister_inetaddr_notifier(&mptcp_pm_inetaddr_notifier);
@@ -937,6 +1260,9 @@ err_reg_inetaddr:
 
 static void full_mesh_unregister(void)
 {
+#if IS_ENABLED(CONFIG_IPV6)
+	unregister_inet6addr_notifier(&inet6_addr_notifier);
+#endif
 	unregister_netdevice_notifier(&mptcp_pm_netdev_notifier);
 	unregister_inetaddr_notifier(&mptcp_pm_inetaddr_notifier);
 	unregister_pernet_subsys(&full_mesh_net_ops);

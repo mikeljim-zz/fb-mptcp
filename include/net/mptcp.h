@@ -31,6 +31,7 @@
 #define _MPTCP_H
 
 #include <linux/inetdevice.h>
+#include <linux/ipv6.h>
 #include <linux/list.h>
 #include <linux/net.h>
 #include <linux/netpoll.h>
@@ -70,6 +71,20 @@ struct mptcp_rem4 {
 	u8		retry_bitfield;
 	__be16		port;
 	struct in_addr	addr;
+};
+
+struct mptcp_loc6 {
+	u8		id;
+	u8		low_prio:1;
+	struct in6_addr	addr;
+};
+
+struct mptcp_rem6 {
+	u8		id;
+	u8		bitfield;
+	u8		retry_bitfield;
+	__be16		port;
+	struct in6_addr	addr;
 };
 
 struct mptcp_request_sock {
@@ -294,6 +309,9 @@ struct mptcp_cb {
 	/* Remote addresses */
 	struct mptcp_rem4 remaddr4[MPTCP_MAX_ADDR];
 	u8 rem4_bits;
+
+	struct mptcp_rem6 remaddr6[MPTCP_MAX_ADDR];
+	u8 rem6_bits;
 
 	u32 path_index_bits;
 	/* Next pi to pick up in case a new path becomes available */
