@@ -1127,6 +1127,8 @@ void mptcp_update_metasocket(struct sock *sk, struct sock *meta_sk)
 
 	if (mpcb->pm_ops->new_session)
 		mpcb->pm_ops->new_session(meta_sk, id);
+
+	tcp_sk(sk)->mptcp->send_mp_prio = tcp_sk(sk)->mptcp->low_prio;
 }
 
 /* Clean up the receive buffer for full frames taken by the user,

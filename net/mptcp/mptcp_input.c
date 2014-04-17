@@ -2074,12 +2074,12 @@ bool mptcp_should_expand_sndbuf(struct sock *meta_sk)
 
 		/* Backup-flows have to be counted - if there is no other
 		 * subflow we take the backup-flow into account. */
-		if (tp_it->mptcp->rcv_low_prio) {
+		if (tp_it->mptcp->rcv_low_prio || tp_it->mptcp->low_prio) {
 			cnt_backups++;
 		}
 
 		if (tp_it->packets_out < tp_it->snd_cwnd) {
-			if (tp_it->mptcp->rcv_low_prio) {
+			if (tp_it->mptcp->rcv_low_prio || tp_it->mptcp->low_prio) {
 				backup_available = 1;
 				continue;
 			}

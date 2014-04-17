@@ -18,7 +18,8 @@ struct mptcp_loc_addr {
 struct mptcp_addr_event {
 	struct list_head list;
 	unsigned short	family;
-	u8	code:7;
+	u8	code:7,
+		low_prio:1;
 	union {
 		struct in_addr addr4;
 	}u;
@@ -308,6 +309,11 @@ next_event:
 
 			/* It might have been a MOD-event. */
 			event->code = MPTCP_EVENT_ADD;
+		} else {
+			/* Let's check if anything changes */
+			if (event->family == AF_INET && 
+			    event->low_prio == mptcp_local->locaddr4[i].low_prio)
+				goto duno;
 		}
 
 		old = mptcp_local;
@@ -319,6 +325,7 @@ next_event:
 		if (event->family == AF_INET) {
 			mptcp_local->locaddr4[i].addr.s_addr = event->u.addr4.s_addr;
 			mptcp_local->locaddr4[i].id = i;
+			mptcp_local->locaddr4[i].low_prio = event->low_prio;
 		}
 
 		if (j < 0) {
@@ -438,6 +445,25 @@ duno:
 				if (id > 0)
 					update_remove_addrs(id, meta_sk, mptcp_local);
 			}
+
+			if (event->code == MPTCP_EVENT_MOD) {
+				struct sock *sk;
+
+				mptcp_for_each_sk(mpcb, sk) {
+					struct tcp_sock *tp = tcp_sk(sk);
+					if (event->family == AF_INET &&
+					    (sk->sk_family == AF_INET ||
+					     mptcp_v6_is_v4_mapped(sk)) &&
+					     inet_sk(sk)->inet_saddr == event->u.addr4.s_addr) {
+						if (event->low_prio != tp->mptcp->low_prio) {
+							tp->mptcp->send_mp_prio = 1;
+							tp->mptcp->low_prio = event->low_prio;
+
+							tcp_send_ack(sk);
+						}
+					}
+				}
+			}
 next:
 			bh_unlock_sock(meta_sk);
 			sock_put(meta_sk);
@@ -477,9 +503,11 @@ static void add_pm_event(struct net *net, struct mptcp_addr_event *event)
 			kfree(eventq);
 			break;
 		case MPTCP_EVENT_ADD:
+			eventq->low_prio = event->low_prio;
 			eventq->code = MPTCP_EVENT_ADD;
 			return;
 		case MPTCP_EVENT_MOD:
+			eventq->low_prio = event->low_prio;
 			return;
 		}
 	}
@@ -512,6 +540,7 @@ static void addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
 
 	mpevent.family = AF_INET;
 	mpevent.u.addr4.s_addr = ifa->ifa_local;
+	mpevent.low_prio = (netdev->flags & IFF_MPBACKUP) ? 1 : 0;
 
 	if (event == NETDEV_DOWN || !netif_running(netdev))
 		mpevent.code = MPTCP_EVENT_DEL;
@@ -657,6 +686,8 @@ static void full_mesh_release_sock(struct sock *meta_sk)
 		bool found = false;
 
 		mptcp_for_each_sk(mpcb, sk) {
+			struct tcp_sock *tp = tcp_sk(sk);
+
 			if (sk->sk_family == AF_INET6 &&
 			    !mptcp_v6_is_v4_mapped(sk))
 				continue;
@@ -665,6 +696,13 @@ static void full_mesh_release_sock(struct sock *meta_sk)
 				continue;
 
 			found = true;
+
+			if (mptcp_local->locaddr4[i].low_prio != tp->mptcp->low_prio) {
+				tp->mptcp->send_mp_prio = 1;
+				tp->mptcp->low_prio = mptcp_local->locaddr4[i].low_prio;
+
+				tcp_send_ack(sk);
+			}
 		}
 
 		if (!found) {

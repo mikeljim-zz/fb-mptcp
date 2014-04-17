@@ -500,6 +500,7 @@ int mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 		goto error;
 
 	tp->mptcp->slave_sk = 1;
+	tp->mptcp->low_prio = loc->low_prio;
 
 	/* Initializing the timer for an MPTCP subflow */
 	setup_timer(&tp->mptcp->mptcp_ack_timer, mptcp_ack_handler, (unsigned long)sk);
