@@ -542,7 +542,8 @@ static void addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
 	mpevent.u.addr4.s_addr = ifa->ifa_local;
 	mpevent.low_prio = (netdev->flags & IFF_MPBACKUP) ? 1 : 0;
 
-	if (event == NETDEV_DOWN || !netif_running(netdev))
+	if (event == NETDEV_DOWN || !netif_running(netdev) ||
+	    (netdev->flags & IFF_NOMULTIPATH))
 		mpevent.code = MPTCP_EVENT_DEL;
 	else if (event == NETDEV_UP)
 		mpevent.code = MPTCP_EVENT_ADD;
