@@ -56,6 +56,8 @@ static struct kmem_cache *mptcp_tw_cache __read_mostly;
 
 int sysctl_mptcp_enabled __read_mostly = 1;
 int sysctl_mptcp_checksum __read_mostly = 1;
+int sysctl_mptcp_debug __read_mostly;
+EXPORT_SYMBOL(sysctl_mptcp_debug);
 int sysctl_mptcp_syn_retries __read_mostly = 3;
 
 bool mptcp_init_failed __read_mostly;
@@ -90,6 +92,13 @@ static struct ctl_table mptcp_table[] = {
 	{
 		.procname = "mptcp_checksum",
 		.data = &sysctl_mptcp_checksum,
+		.maxlen = sizeof(int),
+		.mode = 0644,
+		.proc_handler = &proc_dointvec
+	},
+	{
+		.procname = "mptcp_debug",
+		.data = &sysctl_mptcp_debug,
 		.maxlen = sizeof(int),
 		.mode = 0644,
 		.proc_handler = &proc_dointvec
@@ -379,6 +388,17 @@ struct sock *mptcp_select_ack_sock(const struct sock *meta_sk, int copied)
 		}
 	}
 
+	if (!subsk) {
+		mptcp_debug("%s subsk is null, copied %d, cseq %u\n", __func__,
+			    copied, meta_tp->copied_seq);
+		mptcp_for_each_sk(meta_tp->mpcb, sk) {
+			struct tcp_sock *tp = tcp_sk(sk);
+			mptcp_debug("%s pi %d state %u last_dseq %u\n",
+				    __func__, tp->mptcp->path_index, sk->sk_state,
+				    tp->mptcp->last_data_seq);
+		}
+	}
+
 	return subsk;
 }
 EXPORT_SYMBOL(mptcp_select_ack_sock);
@@ -448,6 +468,8 @@ static void mptcp_sock_destruct(struct sock *sk)
 		spin_unlock_bh(&mpcb->tw_lock);
 
 		mptcp_mpcb_put(mpcb);
+
+		mptcp_debug("%s destroying meta-sk\n", __func__);
 	}
 }
 
@@ -979,6 +1001,9 @@ int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key, u32 window)
 
 	mptcp_init_path_manager(mpcb);
 
+	mptcp_debug("%s: created mpcb with token %#x\n",
+		    __func__, mpcb->mptcp_loc_token);
+
 	return 0;
 }
 
@@ -1062,6 +1087,24 @@ int mptcp_add_sock(struct sock *meta_sk, struct sock *sk, u8 loc_id, u8 rem_id,
 	sk->sk_state_change = mptcp_set_state;
 	sk->sk_destruct = mptcp_sock_destruct;
 
+	if (sk->sk_family == AF_INET)
+		mptcp_debug("%s: token %#x pi %d, src_addr:%pI4:%d dst_addr:%pI4:%d, cnt_subflows now %d\n",
+			    __func__ , mpcb->mptcp_loc_token,
+			    tp->mptcp->path_index,
+			    &((struct inet_sock *)tp)->inet_saddr,
+			    ntohs(((struct inet_sock *)tp)->inet_sport),
+			    &((struct inet_sock *)tp)->inet_daddr,
+			    ntohs(((struct inet_sock *)tp)->inet_dport),
+			    mpcb->cnt_subflows);
+	else
+		mptcp_debug("%s: token %#x pi %d, src_addr:%pI6:%d dst_addr:%pI6:%d, cnt_subflows now %d\n",
+			    __func__ , mpcb->mptcp_loc_token,
+			    tp->mptcp->path_index, &inet6_sk(sk)->saddr,
+			    ntohs(((struct inet_sock *)tp)->inet_sport),
+			    &inet6_sk(sk)->daddr,
+			    ntohs(((struct inet_sock *)tp)->inet_dport),
+			    mpcb->cnt_subflows);
+
 	return 0;
 }
 
@@ -1075,6 +1118,10 @@ void mptcp_del_sock(struct sock *sk)
 
 	mpcb = tp->mpcb;
 	tp_prev = mpcb->connection_list;
+
+	mptcp_debug("%s: Removing subsock tok %#x pi:%d state %d is_meta? %d\n",
+		    __func__, mpcb->mptcp_loc_token, tp->mptcp->path_index,
+		    sk->sk_state, is_meta_sk(sk));
 
 	if (tp_prev == tp) {
 		mpcb->connection_list = tp->mptcp->next;
@@ -1388,6 +1435,9 @@ void mptcp_close(struct sock *meta_sk, long timeout)
 	struct sk_buff *skb;
 	int data_was_unread = 0;
 	int state;
+
+	mptcp_debug("%s: Close of meta_sk with tok %#x\n",
+		    __func__, mpcb->mptcp_loc_token);
 
 	mutex_lock(&mpcb->mpcb_mutex);
 	lock_sock(meta_sk);

@@ -345,6 +345,11 @@ static int mptcp_verif_dss_csum(struct sock *sk)
 
 	/* Now, checksum must be 0 */
 	if (unlikely(csum_fold(csum_tcp))) {
+		pr_err("%s csum is wrong: %#x data_seq %u dss_csum_added %d overflowed %d iterations %d\n",
+			    __func__, csum_fold(csum_tcp),
+			    TCP_SKB_CB(last)->seq, dss_csum_added, overflowed,
+			    iter);
+
 		tp->mptcp->send_mp_fail = 1;
 
 		/* map_data_seq is the data-seq number of the
@@ -532,6 +537,11 @@ static int mptcp_prevalidate_skb(struct sock *sk, struct sk_buff *skb)
 	 */
 	if (!tp->mptcp->fully_established && !mptcp_is_data_seq(skb) &&
 	    !tp->mptcp->mapping_present && !tp->mpcb->infinite_mapping_rcv) {
+		pr_err("%s %#x will fallback - pi %d from %pS, seq %u\n",
+		       __func__, tp->mpcb->mptcp_loc_token,
+		       tp->mptcp->path_index, __builtin_return_address(0),
+		       TCP_SKB_CB(skb)->seq);
+
 		if (!is_master_tp(tp)) {
 			mptcp_send_reset(sk);
 			return 1;
@@ -614,6 +624,12 @@ static int mptcp_detect_mapping(struct sock *sk, struct sk_buff *skb)
 	     data_len != tp->mptcp->map_data_len + tp->mptcp->map_data_fin ||
 	     mptcp_is_data_fin(skb) != tp->mptcp->map_data_fin)) {
 		/* Mapping in packet is different from what we want */
+		pr_err("%s Mappings do not match!\n", __func__);
+		pr_err("%s dseq %u mdseq %u, sseq %u msseq %u dlen %u mdlen %u dfin %d mdfin %d\n",
+		       __func__, data_seq, (u32)tp->mptcp->map_data_seq,
+		       sub_seq, tp->mptcp->map_subseq, data_len,
+		       tp->mptcp->map_data_len, mptcp_is_data_fin(skb),
+		       tp->mptcp->map_data_fin);
 		mptcp_send_reset(sk);
 		return 1;
 	}
@@ -696,6 +712,10 @@ static int mptcp_detect_mapping(struct sock *sk, struct sk_buff *skb)
 		/* Subflow-sequences of packet is different from what is in the
 		 * packet's dss-mapping. The peer is misbehaving - reset
 		 */
+		pr_err("%s Packet's mapping does not map to the DSS sub_seq %u "
+		       "end_seq %u, tcp_end_seq %u seq %u dfin %u len %u data_len %u"
+		       "copied_seq %u\n", __func__, sub_seq, tcb->end_seq, tcp_end_seq, tcb->seq, mptcp_is_data_fin(skb),
+		       skb->len, data_len, tp->copied_seq);
 		mptcp_send_reset(sk);
 		return 1;
 	}
@@ -1120,8 +1140,10 @@ int mptcp_lookup_join(struct sk_buff *skb, struct inet_timewait_sock *tw)
 
 	token = join_opt->u.syn.token;
 	meta_sk = mptcp_hash_find(dev_net(skb_dst(skb)->dev), token);
-	if (!meta_sk)
+	if (!meta_sk) {
+		mptcp_debug("%s:mpcb not found:%x\n", __func__, token);
 		return -1;
+	}
 
 	mpcb = tcp_sk(meta_sk)->mpcb;
 	if (mpcb->infinite_mapping_rcv || mpcb->send_infinite_mapping) {
@@ -1173,8 +1195,10 @@ int mptcp_do_join_short(struct sk_buff *skb, struct mptcp_options_received *mopt
 
 	token = mopt->mptcp_rem_token;
 	meta_sk = mptcp_hash_find(net, token);
-	if (!meta_sk)
+	if (!meta_sk) {
+		mptcp_debug("%s:mpcb not found:%x\n", __func__, token);
 		return -1;
+	}
 
 	TCP_SKB_CB(skb)->mptcp_flags = MPTCPHDR_JOIN;
 
@@ -1524,8 +1548,11 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		struct mp_capable *mpcapable = (struct mp_capable *)ptr;
 
 		if (opsize != MPTCP_SUB_LEN_CAPABLE_SYN &&
-		    opsize != MPTCP_SUB_LEN_CAPABLE_ACK)
+		    opsize != MPTCP_SUB_LEN_CAPABLE_ACK) {
+			mptcp_debug("%s: mp_capable: bad option size %d\n",
+				    __func__, opsize);
 			break;
+		}
 
 		if (!sysctl_mptcp_enabled)
 			break;
@@ -1564,8 +1591,11 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 
 		if (opsize != MPTCP_SUB_LEN_JOIN_SYN &&
 		    opsize != MPTCP_SUB_LEN_JOIN_SYNACK &&
-		    opsize != MPTCP_SUB_LEN_JOIN_ACK)
+		    opsize != MPTCP_SUB_LEN_JOIN_ACK) {
+			mptcp_debug("%s: mp_join: bad option size %d\n",
+				    __func__, opsize);
 			break;
+		}
 
 		/* saw_mpc must be set, because in tcp_check_req we assume that
 		 * it is set to support falling back to reg. TCP if a rexmitted
@@ -1608,8 +1638,11 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		 * It will get ignored later in mptcp_queue_skb.
 		 */
 		if (opsize != mptcp_sub_len_dss(mdss, 0) &&
-		    opsize != mptcp_sub_len_dss(mdss, 1))
+		    opsize != mptcp_sub_len_dss(mdss, 1)) {
+			mptcp_debug("%s: mp_dss: bad option size %d\n",
+				    __func__, opsize);
 			break;
+		}
 
 		ptr += 4;
 
@@ -1657,8 +1690,11 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 	case MPTCP_SUB_ADD_ADDR:
 	{
 		if (opsize != MPTCP_SUB_LEN_ADD_ADDR4 &&
-		    opsize != MPTCP_SUB_LEN_ADD_ADDR4 + 2)
+		    opsize != MPTCP_SUB_LEN_ADD_ADDR4 + 2) {
+			mptcp_debug("%s: mp_add_addr: bad option size %d\n",
+				    __func__, opsize);
 			break;
+		}
 
 		/* We have to manually parse the options if we got two of them. */
 		if (mopt->saw_add_addr) {
@@ -1670,8 +1706,11 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		break;
 	}
 	case MPTCP_SUB_REMOVE_ADDR:
-		if ((opsize - MPTCP_SUB_LEN_REMOVE_ADDR) < 0)
+		if ((opsize - MPTCP_SUB_LEN_REMOVE_ADDR) < 0) {
+			mptcp_debug("%s: mp_remove_addr: bad option size %d\n",
+				    __func__, opsize);
 			break;
+		}
 
 		if (mopt->saw_rem_addr) {
 			mopt->more_rem_addr = 1;
@@ -1685,8 +1724,11 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		struct mp_prio *mpprio = (struct mp_prio *)ptr;
 
 		if (opsize != MPTCP_SUB_LEN_PRIO &&
-		    opsize != MPTCP_SUB_LEN_PRIO_ADDR)
+		    opsize != MPTCP_SUB_LEN_PRIO_ADDR) {
+			mptcp_debug("%s: mp_prio: bad option size %d\n",
+				    __func__, opsize);
 			break;
+		}
 
 		mopt->saw_low_prio = 1;
 		mopt->low_prio = mpprio->b;
@@ -1698,20 +1740,27 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		break;
 	}
 	case MPTCP_SUB_FAIL:
-		if (opsize != MPTCP_SUB_LEN_FAIL)
+		if (opsize != MPTCP_SUB_LEN_FAIL) {
+			mptcp_debug("%s: mp_fail: bad option size %d\n",
+				    __func__, opsize);
 			break;
-
+		}
 		mopt->mp_fail = 1;
 		break;
 	case MPTCP_SUB_FCLOSE:
-		if (opsize != MPTCP_SUB_LEN_FCLOSE)
+		if (opsize != MPTCP_SUB_LEN_FCLOSE) {
+			mptcp_debug("%s: mp_fclose: bad option size %d\n",
+				    __func__, opsize);
 			break;
+		}
 
 		mopt->mp_fclose = 1;
 		mopt->mptcp_key = ((struct mp_fclose *)ptr)->key;
 
 		break;
 	default:
+		mptcp_debug("%s: Received unkown subtype: %d\n",
+			    __func__, mp_opt->sub);
 		break;
 	}
 }
