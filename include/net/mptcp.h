@@ -108,12 +108,16 @@ struct mptcp_options_received {
 				 */
 		more_add_addr:1, /* Saw one more add-addr. */
 
+		saw_rem_addr:1, /* Saw at least one rem_addr option */
+		more_rem_addr:1, /* Saw one more rem-addr. */
+
 		mp_fail:1,
 		mp_fclose:1;
 	u8	rem_id;		/* Address-id in the MP_JOIN */
 	u8	prio_addr_id;	/* Address-id in the MP_PRIO */
 
 	const unsigned char *add_addr_ptr; /* Pointer to add-address option */
+	const unsigned char *rem_addr_ptr; /* Pointer to rem-address option */
 
 	u32	data_ack;
 	u32	data_seq;
@@ -349,6 +353,9 @@ struct mptcp_cb {
 #define MPTCP_SUB_LEN_ADD_ADDR4_ALIGN	8
 #define MPTCP_SUB_LEN_ADD_ADDR6_ALIGN	20
 
+#define MPTCP_SUB_REMOVE_ADDR	4
+#define MPTCP_SUB_LEN_REMOVE_ADDR	4
+
 #define MPTCP_SUB_FAIL		6
 #define MPTCP_SUB_LEN_FAIL	12
 #define MPTCP_SUB_LEN_FAIL_ALIGN	12
@@ -375,6 +382,7 @@ extern bool mptcp_init_failed;
 #define OPTION_MP_JOIN		(1 << 6)
 #define OPTION_MP_FAIL		(1 << 7)
 #define OPTION_MP_FCLOSE	(1 << 8)
+#define OPTION_REMOVE_ADDR	(1 << 9)
 
 /* MPTCP flags */
 #define MPTCPHDR_ACK		0x01
@@ -509,6 +517,22 @@ struct mp_add_addr {
 		} v6;
 	} u;
 } __attribute__((__packed__));
+
+struct mp_remove_addr {
+	__u8	kind;
+	__u8	len;
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	__u8	rsv:4,
+		sub:4;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	__u8	sub:4,
+		rsv:4;
+#else
+#error "Adjust your <asm/byteorder.h> defines"
+#endif
+	/* list of addr_id */
+	__u8	addrs_id;
+};
 
 struct mp_fail {
 	__u8	kind;
@@ -890,6 +914,9 @@ static inline void mptcp_init_mp_opt(struct mptcp_options_received *mopt)
 	mopt->saw_add_addr = 0;
 	mopt->more_add_addr = 0;
 
+	mopt->saw_rem_addr = 0;
+	mopt->more_rem_addr = 0;
+
 	mopt->mp_fail = 0;
 	mopt->mp_fclose = 0;
 }
@@ -900,6 +927,8 @@ static inline void mptcp_reset_mopt(struct tcp_sock *tp)
 
 	mopt->saw_add_addr = 0;
 	mopt->more_add_addr = 0;
+	mopt->saw_rem_addr = 0;
+	mopt->more_rem_addr = 0;
 	mopt->join_ack = 0;
 	mopt->mp_fail = 0;
 	mopt->mp_fclose = 0;

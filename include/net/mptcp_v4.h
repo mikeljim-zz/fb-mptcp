@@ -42,6 +42,7 @@ extern struct request_sock_ops mptcp_request_sock_ops;
 #ifdef CONFIG_MPTCP
 
 int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb);
+int mptcp_v4_rem_raddress(struct mptcp_cb *mpcb, u8 id);
 int mptcp_v4_add_raddress(struct mptcp_cb *mpcb, const struct in_addr *addr,
 			  __be16 port, u8 id);
 void mptcp_v4_set_init_addr_bit(struct mptcp_cb *mpcb, __be32 daddr, u8 id);

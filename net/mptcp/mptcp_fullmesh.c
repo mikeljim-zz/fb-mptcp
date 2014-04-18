@@ -5,6 +5,7 @@
 
 enum {
 	MPTCP_EVENT_ADD = 1,
+	MPTCP_EVENT_DEL,
 	MPTCP_EVENT_MOD,
 };
 
@@ -31,6 +32,7 @@ struct fullmesh_priv {
 
 	struct mptcp_cb *mpcb;
 
+	u16 remove_addrs; /* Addresses to remove */
 	u8 announced_addrs_v4; /* IPv4 Addresses we did announce */
 
 	u8	add_addr; /* Are we sending an add_addr? */
@@ -191,6 +193,30 @@ exit:
 	sock_put(meta_sk);
 }
 
+static void update_remove_addrs(u8 addr_id, struct sock *meta_sk,
+				struct mptcp_loc_addr *mptcp_local)
+{
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct fullmesh_priv *fmp = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
+	struct sock *sk;
+	int i;
+
+	fmp->remove_addrs |= (1 << addr_id);
+	/* v4 goes from 0 to MPTCP_MAX_ADDR, v6 beyond */
+	if (addr_id < MPTCP_MAX_ADDR) {
+		fmp->announced_addrs_v4 &= ~(1 << addr_id);
+
+		mptcp_for_each_bit_set(mpcb->rem4_bits, i) {
+			mpcb->remaddr4[i].bitfield &= mptcp_local->loc4_bits;
+			mpcb->remaddr4[i].retry_bitfield &= mptcp_local->loc4_bits;
+		}
+	}
+
+	sk = mptcp_select_ack_sock(meta_sk, 0);
+	if (sk)
+		tcp_send_ack(sk);
+}
+
 static int mptcp_find_address(struct mptcp_loc_addr *mptcp_local,
 			      struct mptcp_addr_event *event)
 {
@@ -226,7 +252,7 @@ static void mptcp_address_worker(struct work_struct *work)
 	struct net *net = fm_ns->net;
 	struct mptcp_addr_event *event = NULL;
 	struct mptcp_loc_addr *mptcp_local, *old;
-	int i;
+	int i, id = -1; /* id is used in the socket-code on a delete-event */
 	bool success; /* Used to indicate if we succeeded handling the event */
 
 next_event:
@@ -249,7 +275,25 @@ next_event:
 
 	mptcp_local = rcu_dereference_bh(fm_ns->local);
 
-{
+	if (event->code == MPTCP_EVENT_DEL) {
+		id = mptcp_find_address(mptcp_local, event);
+
+		/* Not in the list - so we don't care */
+		if (id < 0)
+			goto duno;
+
+		old = mptcp_local;
+		mptcp_local = kmemdup(mptcp_local, sizeof(*mptcp_local),
+				      GFP_ATOMIC);
+		if (!mptcp_local)
+			goto duno;
+
+		if (event->family == AF_INET)
+			mptcp_local->loc4_bits &= ~(1 << id);
+
+		rcu_assign_pointer(fm_ns->local, mptcp_local);
+		kfree(old);
+	} else {
 		int i = mptcp_find_address(mptcp_local, event);
 		int j = i;
 
@@ -286,7 +330,7 @@ next_event:
 
 		rcu_assign_pointer(fm_ns->local, mptcp_local);
 		kfree(old);
-}
+	}
 	success = true;
 
 duno:
@@ -340,6 +384,60 @@ duno:
 
 				full_mesh_create_subflows(meta_sk);
 			}
+
+			if (event->code == MPTCP_EVENT_DEL) {
+				struct sock *sk, *tmpsk;
+				struct mptcp_loc_addr *mptcp_local;
+				bool found = false;
+
+				mptcp_local = rcu_dereference_bh(fm_ns->local);
+
+				/* Look for the socket and remove him */
+				mptcp_for_each_sk_safe(mpcb, sk, tmpsk) {
+					if ((event->family == AF_INET6 &&
+					     (sk->sk_family == AF_INET ||
+					      mptcp_v6_is_v4_mapped(sk))) ||
+					    (event->family == AF_INET &&
+					     (sk->sk_family == AF_INET6 &&
+					      !mptcp_v6_is_v4_mapped(sk))))
+						continue;
+
+					if (event->family == AF_INET &&
+					    (sk->sk_family == AF_INET ||
+					     mptcp_v6_is_v4_mapped(sk)) &&
+					     inet_sk(sk)->inet_saddr != event->u.addr4.s_addr)
+						continue;
+
+					/* Reinject, so that pf = 1 and so we
+					 * won't select this one as the
+					 * ack-sock.
+					 */
+					mptcp_reinject_data(sk, 0);
+
+					/* A master is special, it has
+					 * address-id 0
+					 */
+					if (!tcp_sk(sk)->mptcp->loc_id)
+						update_remove_addrs(0, meta_sk, mptcp_local);
+					else if (tcp_sk(sk)->mptcp->loc_id != id)
+						update_remove_addrs(tcp_sk(sk)->mptcp->loc_id, meta_sk, mptcp_local);
+
+					mptcp_sub_force_close(sk);
+					found = true;
+				}
+
+				if (!found)
+					goto next;
+
+				/* The id may have been given by the event,
+				 * matching on a local address. And it may not
+				 * have matched on one of the above sockets,
+				 * because the client never created a subflow.
+				 * So, we have to finally remove it here.
+				 */
+				if (id > 0)
+					update_remove_addrs(id, meta_sk, mptcp_local);
+			}
 next:
 			bh_unlock_sock(meta_sk);
 			sock_put(meta_sk);
@@ -374,6 +472,10 @@ static void add_pm_event(struct net *net, struct mptcp_addr_event *event)
 
 	if (eventq) {
 		switch (event->code) {
+		case MPTCP_EVENT_DEL:
+			list_del(&eventq->list);
+			kfree(eventq);
+			break;
 		case MPTCP_EVENT_ADD:
 			eventq->code = MPTCP_EVENT_ADD;
 			return;
@@ -398,6 +500,7 @@ static void add_pm_event(struct net *net, struct mptcp_addr_event *event)
 static void addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
 				struct net *net)
 {
+	struct net_device *netdev = ifa->ifa_dev->dev;
 	struct mptcp_fm_ns *fm_ns = fm_get_ns(net);
 	struct mptcp_addr_event mpevent;
 
@@ -410,7 +513,9 @@ static void addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
 	mpevent.family = AF_INET;
 	mpevent.u.addr4.s_addr = ifa->ifa_local;
 
-	if (event == NETDEV_UP)
+	if (event == NETDEV_DOWN || !netif_running(netdev))
+		mpevent.code = MPTCP_EVENT_DEL;
+	else if (event == NETDEV_UP)
 		mpevent.code = MPTCP_EVENT_ADD;
 	else if (event == NETDEV_CHANGE)
 		mpevent.code = MPTCP_EVENT_MOD;
@@ -540,7 +645,7 @@ static void full_mesh_release_sock(struct sock *meta_sk)
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct fullmesh_priv *fmp = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
 	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(meta_sk));
-	struct sock *sk;
+	struct sock *sk, *tmpsk;
 	int i;
 
 	rcu_read_lock();
@@ -569,6 +674,36 @@ static void full_mesh_release_sock(struct sock *meta_sk)
 			if (sk)
 				tcp_send_ack(sk);
 			full_mesh_create_subflows(meta_sk);
+		}
+	}
+
+	/* Now, detect address-removals */
+	mptcp_for_each_sk_safe(mpcb, sk, tmpsk) {
+		bool shall_remove = true;
+
+		if (sk->sk_family == AF_INET || mptcp_v6_is_v4_mapped(sk)) {
+			mptcp_for_each_bit_set(mptcp_local->loc4_bits, i) {
+				if (inet_sk(sk)->inet_saddr == mptcp_local->locaddr4[i].addr.s_addr) {
+					shall_remove = false;
+					break;
+				}
+			}
+		}
+
+		if (shall_remove) {
+			/* Reinject, so that pf = 1 and so we
+			 * won't select this one as the
+			 * ack-sock.
+			 */
+			mptcp_reinject_data(sk, 0);
+
+			update_remove_addrs(tcp_sk(sk)->mptcp->loc_id, meta_sk,
+					    mptcp_local);
+
+			if (mpcb->master_sk == sk)
+				update_remove_addrs(0, meta_sk, mptcp_local);
+
+			mptcp_sub_force_close(sk);
 		}
 	}
 	rcu_read_unlock();
@@ -607,10 +742,11 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 	struct fullmesh_priv *fmp = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
 	struct mptcp_loc_addr *mptcp_local;
 	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(sk));
+	int remove_addr_len;
 	u8 unannouncedv4;
 
 	if (likely(!fmp->add_addr))
-		return;
+		goto remove_addr;
 
 	rcu_read_lock();
 	mptcp_local = rcu_dereference(fm_ns->local);
@@ -639,6 +775,21 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 	if (!unannouncedv4 && skb) {
 		fmp->add_addr--;
 	}
+
+remove_addr:
+	if (likely(!fmp->remove_addrs))
+		return;
+
+	remove_addr_len = mptcp_sub_len_remove_addr_align(fmp->remove_addrs);
+	if (MAX_TCP_OPTION_SPACE - *size < remove_addr_len)
+		return;
+
+	opts->options |= OPTION_MPTCP;
+	opts->mptcp_options |= OPTION_REMOVE_ADDR;
+	opts->remove_addrs = fmp->remove_addrs;
+	*size += remove_addr_len;
+	if (skb)
+		fmp->remove_addrs = 0;
 }
 
 static int mptcp_fm_init_net(struct net *net)

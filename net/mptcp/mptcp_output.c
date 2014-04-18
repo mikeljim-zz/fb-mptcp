@@ -40,6 +40,20 @@ static inline int mptcp_pi_to_flag(int pi)
 	return 1 << (pi - 1);
 }
 
+static inline int mptcp_sub_len_remove_addr(u16 bitfield)
+{
+	unsigned int c;
+	for (c = 0; bitfield; c++)
+		bitfield &= bitfield - 1;
+	return MPTCP_SUB_LEN_REMOVE_ADDR + c - 1;
+}
+
+int mptcp_sub_len_remove_addr_align(u16 bitfield)
+{
+	return ALIGN(mptcp_sub_len_remove_addr(bitfield), 4);
+}
+EXPORT_SYMBOL(mptcp_sub_len_remove_addr_align);
+
 /* If the sub-socket sk available to send the skb? */
 static int mptcp_is_available(struct sock *sk, struct sk_buff *skb,
 			      unsigned int *mss)
@@ -1507,6 +1521,32 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 			mpadd->u.v4.addr = opts->add_addr4.addr;
 			ptr += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN >> 2;
 		}
+	}
+	if (unlikely(OPTION_REMOVE_ADDR & opts->mptcp_options)) {
+		struct mp_remove_addr *mprem = (struct mp_remove_addr *)ptr;
+		u8 *addrs_id;
+		int id, len, len_align;
+
+		len = mptcp_sub_len_remove_addr(opts->remove_addrs);
+		len_align = mptcp_sub_len_remove_addr_align(opts->remove_addrs);
+
+		mprem->kind = TCPOPT_MPTCP;
+		mprem->len = len;
+		mprem->sub = MPTCP_SUB_REMOVE_ADDR;
+		mprem->rsv = 0;
+		addrs_id = &mprem->addrs_id;
+
+		mptcp_for_each_bit_set(opts->remove_addrs, id)
+			*(addrs_id++) = id;
+
+		/* Fill the rest with NOP's */
+		if (len_align > len) {
+			int i;
+			for (i = 0; i < len_align - len; i++)
+				*(addrs_id++) = TCPOPT_NOP;
+		}
+
+		ptr += len_align >> 2;
 	}
 	if (unlikely(OPTION_MP_FAIL & opts->mptcp_options)) {
 		struct mp_fail *mpfail = (struct mp_fail *)ptr;
