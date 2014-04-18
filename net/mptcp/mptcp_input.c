@@ -1033,6 +1033,195 @@ exit:
 		meta_sk->sk_data_ready(meta_sk, 0);
 }
 
+
+int mptcp_check_req(struct sk_buff *skb, struct net *net)
+{
+	struct tcphdr *th = tcp_hdr(skb);
+	struct sock *meta_sk = NULL;
+
+	/* MPTCP structures not initialized */
+	if (mptcp_init_failed)
+		return 0;
+
+	meta_sk = mptcp_v4_search_req(th->source, ip_hdr(skb)->saddr,
+				      ip_hdr(skb)->daddr, net);
+
+	if (!meta_sk)
+		return 0;
+
+	TCP_SKB_CB(skb)->mptcp_flags = MPTCPHDR_JOIN;
+
+	bh_lock_sock_nested(meta_sk);
+	if (sock_owned_by_user(meta_sk)) {
+		skb->sk = meta_sk;
+		if (unlikely(sk_add_backlog(meta_sk, skb,
+					    meta_sk->sk_rcvbuf + meta_sk->sk_sndbuf))) {
+			bh_unlock_sock(meta_sk);
+			NET_INC_STATS_BH(net, LINUX_MIB_TCPBACKLOGDROP);
+			sock_put(meta_sk); /* Taken by mptcp_search_req */
+			kfree_skb(skb);
+			return 1;
+		}
+	} else {
+		tcp_v4_do_rcv(meta_sk, skb);
+	}
+	bh_unlock_sock(meta_sk);
+	sock_put(meta_sk); /* Taken by mptcp_vX_search_req */
+	return 1;
+}
+
+struct mp_join *mptcp_find_join(struct sk_buff *skb)
+{
+	struct tcphdr *th = tcp_hdr(skb);
+	unsigned char *ptr;
+	int length = (th->doff * 4) - sizeof(struct tcphdr);
+
+	/* Jump through the options to check whether JOIN is there */
+	ptr = (unsigned char *)(th + 1);
+	while (length > 0) {
+		int opcode = *ptr++;
+		int opsize;
+
+		switch (opcode) {
+		case TCPOPT_EOL:
+			return NULL;
+		case TCPOPT_NOP:	/* Ref: RFC 793 section 3.1 */
+			length--;
+			continue;
+		default:
+			opsize = *ptr++;
+			if (opsize < 2)	/* "silly options" */
+				return NULL;
+			if (opsize > length)
+				return NULL;  /* don't parse partial options */
+			if (opcode == TCPOPT_MPTCP &&
+			    ((struct mptcp_option *)(ptr - 2))->sub == MPTCP_SUB_JOIN) {
+				return (struct mp_join *)(ptr - 2);
+			}
+			ptr += opsize - 2;
+			length -= opsize;
+		}
+	}
+	return NULL;
+}
+
+int mptcp_lookup_join(struct sk_buff *skb, struct inet_timewait_sock *tw)
+{
+	struct mptcp_cb *mpcb;
+	struct sock *meta_sk;
+	u32 token;
+	struct mp_join *join_opt = mptcp_find_join(skb);
+	if (!join_opt)
+		return 0;
+
+	/* MPTCP structures were not initialized, so return error */
+	if (mptcp_init_failed)
+		return -1;
+
+	token = join_opt->u.syn.token;
+	meta_sk = mptcp_hash_find(dev_net(skb_dst(skb)->dev), token);
+	if (!meta_sk)
+		return -1;
+
+	mpcb = tcp_sk(meta_sk)->mpcb;
+	if (mpcb->infinite_mapping_rcv || mpcb->send_infinite_mapping) {
+		/* We are in fallback-mode on the reception-side -
+		 * no new subflows!
+		 */
+		sock_put(meta_sk); /* Taken by mptcp_hash_find */
+		return -1;
+	}
+
+	/* Coming from time-wait-sock processing in tcp_v4_rcv.
+	 * We have to deschedule it before continuing, because otherwise
+	 * mptcp_v4_do_rcv will hit again on it inside tcp_v4_hnd_req.
+	 */
+	if (tw) {
+		inet_twsk_deschedule(tw, &tcp_death_row);
+		inet_twsk_put(tw);
+	}
+
+	TCP_SKB_CB(skb)->mptcp_flags = MPTCPHDR_JOIN;
+	/* OK, this is a new syn/join, let's create a new open request and
+	 * send syn+ack
+	 */
+	bh_lock_sock_nested(meta_sk);
+	if (sock_owned_by_user(meta_sk)) {
+		skb->sk = meta_sk;
+		if (unlikely(sk_add_backlog(meta_sk, skb,
+					    meta_sk->sk_rcvbuf + meta_sk->sk_sndbuf))) {
+			bh_unlock_sock(meta_sk);
+			NET_INC_STATS_BH(sock_net(meta_sk),
+					 LINUX_MIB_TCPBACKLOGDROP);
+			sock_put(meta_sk); /* Taken by mptcp_hash_find */
+			kfree_skb(skb);
+			return 1;
+		}
+	} else {
+		tcp_v4_do_rcv(meta_sk, skb);
+	}
+	bh_unlock_sock(meta_sk);
+	sock_put(meta_sk); /* Taken by mptcp_hash_find */
+	return 1;
+}
+
+int mptcp_do_join_short(struct sk_buff *skb, struct mptcp_options_received *mopt,
+			struct tcp_options_received *tmp_opt, struct net *net)
+{
+	struct sock *meta_sk;
+	u32 token;
+
+	token = mopt->mptcp_rem_token;
+	meta_sk = mptcp_hash_find(net, token);
+	if (!meta_sk)
+		return -1;
+
+	TCP_SKB_CB(skb)->mptcp_flags = MPTCPHDR_JOIN;
+
+	/* OK, this is a new syn/join, let's create a new open request and
+	 * send syn+ack
+	 */
+	bh_lock_sock(meta_sk);
+
+	/* This check is also done in mptcp_vX_do_rcv. But, there we cannot
+	 * call tcp_vX_send_reset, because we hold already two socket-locks.
+	 * (the listener and the meta from above)
+	 *
+	 * And the send-reset will try to take yet another one (ip_send_reply).
+	 * Thus, we propagate the reset up to tcp_rcv_state_process.
+	 */
+	if (tcp_sk(meta_sk)->mpcb->infinite_mapping_rcv ||
+	    tcp_sk(meta_sk)->mpcb->send_infinite_mapping ||
+	    meta_sk->sk_state == TCP_CLOSE || !tcp_sk(meta_sk)->inside_tk_table) {
+		bh_unlock_sock(meta_sk);
+		sock_put(meta_sk); /* Taken by mptcp_hash_find */
+		return -1;
+	}
+
+	if (sock_owned_by_user(meta_sk)) {
+		skb->sk = meta_sk;
+		if (unlikely(sk_add_backlog(meta_sk, skb,
+					    meta_sk->sk_rcvbuf + meta_sk->sk_sndbuf)))
+			NET_INC_STATS_BH(net, LINUX_MIB_TCPBACKLOGDROP);
+		else
+			/* Must make sure that upper layers won't free the
+			 * skb if it is added to the backlog-queue.
+			 */
+			skb_get(skb);
+	} else {
+		/* mptcp_v4_do_rcv tries to free the skb - we prevent this, as
+		 * the skb will finally be freed by tcp_v4_do_rcv (where we are
+		 * coming from)
+		 */
+		skb_get(skb);
+		tcp_v4_do_rcv(meta_sk, skb);
+	}
+
+	bh_unlock_sock(meta_sk);
+	sock_put(meta_sk); /* Taken by mptcp_hash_find */
+	return 0;
+}
+
 /**
  * Equivalent of tcp_fin() for MPTCP
  * Can be called only when the FIN is validly part
@@ -1347,6 +1536,41 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 
 		break;
 	}
+	case MPTCP_SUB_JOIN:
+	{
+		struct mp_join *mpjoin = (struct mp_join *)ptr;
+
+		if (opsize != MPTCP_SUB_LEN_JOIN_SYN &&
+		    opsize != MPTCP_SUB_LEN_JOIN_SYNACK &&
+		    opsize != MPTCP_SUB_LEN_JOIN_ACK)
+			break;
+
+		/* saw_mpc must be set, because in tcp_check_req we assume that
+		 * it is set to support falling back to reg. TCP if a rexmitted
+		 * SYN has no MP_CAPABLE or MP_JOIN
+		 */
+		switch (opsize) {
+		case MPTCP_SUB_LEN_JOIN_SYN:
+			mopt->is_mp_join = 1;
+			mopt->saw_mpc = 1;
+			mopt->rem_id = mpjoin->addr_id;
+			mopt->mptcp_rem_token = mpjoin->u.syn.token;
+			mopt->mptcp_recv_nonce = mpjoin->u.syn.nonce;
+			break;
+		case MPTCP_SUB_LEN_JOIN_SYNACK:
+			mopt->saw_mpc = 1;
+			mopt->rem_id = mpjoin->addr_id;
+			mopt->mptcp_recv_tmac = mpjoin->u.synack.mac;
+			mopt->mptcp_recv_nonce = mpjoin->u.synack.nonce;
+			break;
+		case MPTCP_SUB_LEN_JOIN_ACK:
+			mopt->saw_mpc = 1;
+			mopt->join_ack = 1;
+			memcpy(mopt->mptcp_recv_mac, mpjoin->u.ack.mac, 20);
+			break;
+		}
+		break;
+	}
 	case MPTCP_SUB_DSS:
 	{
 		struct mp_dss *mdss = (struct mp_dss *)ptr;
@@ -1613,6 +1837,14 @@ int mptcp_handle_options(struct sock *sk, const struct tcphdr *th, struct sk_buf
 
 		mptcp_sub_force_close(sk);
 		return 1;
+	}
+
+	/* We have to acknowledge retransmissions of the third
+	 * ack.
+	 */
+	if (mopt->join_ack) {
+		tcp_send_delayed_ack(sk);
+		mopt->join_ack = 0;
 	}
 
 	if (mopt->saw_add_addr) {

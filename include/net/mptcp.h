@@ -75,8 +75,17 @@ struct mptcp_rem4 {
 struct mptcp_request_sock {
 	struct tcp_request_sock		req;
 	struct mptcp_cb			*mpcb;
+	/* Collision list in the tuple hashtable. We need to find
+	 * the req sock when receiving the third msg of the 3-way handshake,
+	 * since that one does not contain the token. If this makes
+	 * the request sock too long, we can use kmalloc'ed specific entries for
+	 * that tuple hashtable. At the moment, though, I extend the
+	 * request_sock.
+	 */
+	struct list_head		collide_tuple;
 	struct hlist_nulls_node		collide_tk;
-	u32                             mptcp_loc_token;
+	u32				mptcp_rem_nonce;
+	u32				mptcp_loc_token;
 	u64				mptcp_loc_key;
 	u64				mptcp_rem_key;
 	u64				mptcp_hash_tmac;
@@ -91,6 +100,9 @@ struct mptcp_options_received {
 		dss_csum:1,
 		drop_me:1,
 
+		is_mp_join:1,
+		join_ack:1,
+
 		saw_add_addr:2, /* Saw at least one add_addr option:
 				 * 0x1: IPv4 - 0x2: IPv6
 				 */
@@ -98,6 +110,7 @@ struct mptcp_options_received {
 
 		mp_fail:1,
 		mp_fclose:1;
+	u8	rem_id;		/* Address-id in the MP_JOIN */
 	u8	prio_addr_id;	/* Address-id in the MP_PRIO */
 
 	const unsigned char *add_addr_ptr; /* Pointer to add-address option */
@@ -106,11 +119,14 @@ struct mptcp_options_received {
 	u32	data_seq;
 	u16	data_len;
 
+	u32	mptcp_rem_token;/* Remote token */
+
 	/* Key inside the option (from mp_capable or fast_close) */
 	u64	mptcp_key;
 
 	u32	mptcp_recv_nonce;
 	u64	mptcp_recv_tmac;
+	u8	mptcp_recv_mac[20];
 };
 
 struct mptcp_tcp_sock {
@@ -577,6 +593,14 @@ extern u32 mptcp_key_seed;
 
 extern struct hlist_nulls_head tk_hashtable[MPTCP_HASH_SIZE];
 
+/* This second hashtable is needed to retrieve request socks
+ * created as a result of a join request. While the SYN contains
+ * the token, the final ack does not, so we need a separate hashtable
+ * to retrieve the mpcb.
+ */
+extern struct list_head mptcp_reqsk_htb[MPTCP_HASH_SIZE];
+extern spinlock_t mptcp_reqsk_hlock;	/* hashtable protection */
+
 /* Lock, protecting the two hash-tables that hold the token. Namely,
  * mptcp_reqsk_tk_htb and tk_hashtable
  */
@@ -623,6 +647,10 @@ int mptcp_check_req_master(struct sock *sk, struct sock *child,
 			   struct request_sock *req,
 			   struct request_sock **prev,
 			   struct mptcp_options_received *mopt);
+struct sock *mptcp_check_req_child(struct sock *sk, struct sock *child,
+				   struct request_sock *req,
+				   struct request_sock **prev,
+				   struct mptcp_options_received *mopt);
 u32 __mptcp_select_window(struct sock *sk);
 void mptcp_select_initial_window(int *__space, __u32 *window_clamp,
 			         const struct sock *sk);
@@ -665,14 +693,19 @@ bool mptcp_should_expand_sndbuf(struct sock *meta_sk);
 int mptcp_retransmit_skb(struct sock *meta_sk, struct sk_buff *skb);
 void mptcp_tsq_flags(struct sock *sk);
 void mptcp_tsq_sub_deferred(struct sock *meta_sk);
+struct mp_join *mptcp_find_join(struct sk_buff *skb);
 void mptcp_hash_remove_bh(struct tcp_sock *meta_tp);
 void mptcp_hash_remove(struct tcp_sock *meta_tp);
 struct sock *mptcp_hash_find(struct net *net, u32 token);
+int mptcp_lookup_join(struct sk_buff *skb, struct inet_timewait_sock *tw);
+int mptcp_do_join_short(struct sk_buff *skb, struct mptcp_options_received *mopt,
+			struct tcp_options_received *tmp_opt, struct net *net);
 void mptcp_reqsk_destructor(struct request_sock *req);
 void mptcp_reqsk_new_mptcp(struct request_sock *req,
 			   const struct tcp_options_received *rx_opt,
 			   const struct mptcp_options_received *mopt,
 			   const struct sk_buff *skb);
+int mptcp_check_req(struct sk_buff *skb, struct net *net);
 void mptcp_connect_init(struct sock *sk);
 void mptcp_sub_force_close(struct sock *sk);
 int mptcp_sub_len_remove_addr_align(u16 bitfield);
@@ -692,6 +725,12 @@ static inline
 struct mptcp_request_sock *mptcp_rsk(const struct request_sock *req)
 {
 	return (struct mptcp_request_sock *)req;
+}
+
+static inline
+struct request_sock *rev_mptcp_rsk(const struct mptcp_request_sock *req)
+{
+	return (struct request_sock *)req;
 }
 
 static inline bool mptcp_can_sendpage(struct sock *sk)
@@ -817,11 +856,36 @@ static inline int is_master_tp(const struct tcp_sock *tp)
 	return !tp->mpc || (!tp->mptcp->slave_sk && !is_meta_tp(tp));
 }
 
+static inline void mptcp_hash_request_remove(struct request_sock *req)
+{
+	int in_softirq = 0;
+
+	if (list_empty(&mptcp_rsk(req)->collide_tuple))
+		return;
+
+	if (in_softirq()) {
+		spin_lock(&mptcp_reqsk_hlock);
+		in_softirq = 1;
+	} else {
+		spin_lock_bh(&mptcp_reqsk_hlock);
+	}
+
+	list_del(&mptcp_rsk(req)->collide_tuple);
+
+	if (in_softirq)
+		spin_unlock(&mptcp_reqsk_hlock);
+	else
+		spin_unlock_bh(&mptcp_reqsk_hlock);
+}
+
 static inline void mptcp_init_mp_opt(struct mptcp_options_received *mopt)
 {
 	mopt->saw_mpc = 0;
 	mopt->dss_csum = 0;
 	mopt->drop_me = 0;
+
+	mopt->is_mp_join = 0;
+	mopt->join_ack = 0;
 
 	mopt->saw_add_addr = 0;
 	mopt->more_add_addr = 0;
@@ -836,6 +900,7 @@ static inline void mptcp_reset_mopt(struct tcp_sock *tp)
 
 	mopt->saw_add_addr = 0;
 	mopt->more_add_addr = 0;
+	mopt->join_ack = 0;
 	mopt->mp_fail = 0;
 	mopt->mp_fclose = 0;
 }
@@ -1159,6 +1224,14 @@ static inline int mptcp_check_req_master(const struct sock *sk,
 					 const struct mptcp_options_received *mopt)
 {
 	return 1;
+}
+static inline struct sock *mptcp_check_req_child(struct sock *sk,
+						 struct sock *child,
+						 struct request_sock *req,
+						 struct request_sock **prev,
+						 struct mptcp_options_received *mopt)
+{
+	return NULL;
 }
 static inline u32 __mptcp_select_window(const struct sock *sk)
 {

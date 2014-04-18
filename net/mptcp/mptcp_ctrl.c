@@ -118,6 +118,14 @@ static inline u32 mptcp_hash_tk(u32 token)
 struct hlist_nulls_head tk_hashtable[MPTCP_HASH_SIZE];
 EXPORT_SYMBOL(tk_hashtable);
 
+/* This second hashtable is needed to retrieve request socks
+ * created as a result of a join request. While the SYN contains
+ * the token, the final ack does not, so we need a separate hashtable
+ * to retrieve the mpcb.
+ */
+struct list_head mptcp_reqsk_htb[MPTCP_HASH_SIZE];
+spinlock_t mptcp_reqsk_hlock;	/* hashtable protection */
+
 /* The following hash table is used to avoid collision of token */
 static struct hlist_nulls_head mptcp_reqsk_tk_htb[MPTCP_HASH_SIZE];
 spinlock_t mptcp_tk_hashlock;	/* hashtable protection */
@@ -165,6 +173,8 @@ void mptcp_reqsk_destructor(struct request_sock *req)
 			spin_unlock(&mptcp_tk_hashlock);
 			rcu_read_unlock_bh();
 		}
+	} else {
+		mptcp_hash_request_remove(req);
 	}
 }
 
@@ -302,6 +312,13 @@ void mptcp_hash_remove(struct tcp_sock *meta_tp)
 	meta_tp->inside_tk_table = 0;
 	spin_unlock(&mptcp_tk_hashlock);
 	rcu_read_unlock();
+}
+
+static struct sock *mptcp_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+					struct request_sock *req,
+					struct dst_entry *dst)
+{
+	return tcp_v4_syn_recv_sock(sk, skb, req, dst);
 }
 
 struct sock *mptcp_select_ack_sock(const struct sock *meta_sk, int copied)
@@ -924,6 +941,7 @@ int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key, u32 window)
 	/* Redefine function-pointers as the meta-sk is now fully ready */
 	meta_sk->sk_backlog_rcv = mptcp_backlog_rcv;
 	meta_sk->sk_destruct = mptcp_sock_destruct;
+	mpcb->syn_recv_sock = mptcp_syn_recv_sock;
 
 	/* Meta-level retransmit timer */
 	meta_icsk->icsk_rto *= 2; /* Double of initial - rto */
@@ -967,6 +985,20 @@ int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key, u32 window)
 struct sock *mptcp_sk_clone(const struct sock *sk, int family,
 			    const gfp_t priority)
 {
+	struct sock *newsk = sk_prot_alloc(&tcp_prot, priority, family);
+	if (!newsk)
+		return NULL;
+
+	/* Set these pointers - they are needed by mptcp_inherit_sk */
+	newsk->sk_prot = &tcp_prot;
+	newsk->sk_prot_creator = &tcp_prot;
+	inet_csk(newsk)->icsk_af_ops = &ipv4_specific;
+	newsk->sk_family = AF_INET;
+
+	if (mptcp_inherit_sk(sk, newsk, family, priority))
+		return NULL;
+
+	return newsk;
 }
 
 void mptcp_fallback_meta_sk(struct sock *meta_sk)
@@ -1670,6 +1702,75 @@ int mptcp_check_req_master(struct sock *sk, struct sock *child,
 	return 0;
 }
 
+struct sock *mptcp_check_req_child(struct sock *meta_sk, struct sock *child,
+				   struct request_sock *req,
+				   struct request_sock **prev,
+				   struct mptcp_options_received *mopt)
+{
+	struct tcp_sock *child_tp = tcp_sk(child);
+	struct mptcp_request_sock *mtreq = mptcp_rsk(req);
+	struct mptcp_cb *mpcb = mtreq->mpcb;
+	u8 hash_mac_check[20];
+
+	child_tp->inside_tk_table = 0;
+
+	if (!mopt->join_ack)
+		goto teardown;
+
+	mptcp_hmac_sha1((u8 *)&mpcb->mptcp_rem_key,
+			(u8 *)&mpcb->mptcp_loc_key,
+			(u8 *)&mtreq->mptcp_rem_nonce,
+			(u8 *)&mtreq->mptcp_loc_nonce,
+			(u32 *)hash_mac_check);
+
+	if (memcmp(hash_mac_check, (char *)&mopt->mptcp_recv_mac, 20))
+		goto teardown;
+
+	/* Point it to the same struct socket and wq as the meta_sk */
+	sk_set_socket(child, meta_sk->sk_socket);
+	child->sk_wq = meta_sk->sk_wq;
+
+	if (mptcp_add_sock(meta_sk, child, mtreq->loc_id, mtreq->rem_id, GFP_ATOMIC)) {
+		child_tp->mpc = 0; /* Has been inherited, but now
+				    * child_tp->mptcp is NULL
+				    */
+		/* TODO when we support acking the third ack for new subflows,
+		 * we should silently discard this third ack, by returning NULL.
+		 *
+		 * Maybe, at the retransmission we will have enough memory to
+		 * fully add the socket to the meta-sk.
+		 */
+		goto teardown;
+	}
+
+	/* We should allow proper increase of the snd/rcv-buffers. Thus, we
+	 * use the original values instead of the bloated up ones from the
+	 * clone.
+	 */
+	child->sk_sndbuf = mpcb->orig_sk_sndbuf;
+	child->sk_rcvbuf = mpcb->orig_sk_rcvbuf;
+
+	child_tp->mptcp->slave_sk = 1;
+	child_tp->mptcp->snt_isn = tcp_rsk(req)->snt_isn;
+	child_tp->mptcp->rcv_isn = tcp_rsk(req)->rcv_isn;
+	child_tp->mptcp->init_rcv_wnd = req->rcv_wnd;
+
+	child_tp->tsq_flags = 0;
+
+	/* Subflows do not use the accept queue, as they
+	 * are attached immediately to the mpcb.
+	 */
+	inet_csk_reqsk_queue_drop(meta_sk, req, prev);
+	return child;
+
+teardown:
+	/* Drop this request - sock creation failed. */
+	inet_csk_reqsk_queue_drop(meta_sk, req, prev);
+	inet_csk_prepare_forced_close(child);
+	tcp_done(child);
+	return meta_sk;
+}
+
 int mptcp_time_wait(struct sock *sk, struct tcp_timewait_sock *tw)
 {
 	struct mptcp_tw *mptw;
@@ -1931,9 +2032,11 @@ void __init mptcp_init(void)
 
 	for (i = 0; i < MPTCP_HASH_SIZE; i++) {
 		INIT_HLIST_NULLS_HEAD(&tk_hashtable[i], i);
+		INIT_LIST_HEAD(&mptcp_reqsk_htb[i]);
 		INIT_HLIST_NULLS_HEAD(&mptcp_reqsk_tk_htb[i], i);
 	}
 
+	spin_lock_init(&mptcp_reqsk_hlock);
 	spin_lock_init(&mptcp_tk_hashlock);
 
 	if (register_pernet_subsys(&mptcp_pm_proc_ops))
