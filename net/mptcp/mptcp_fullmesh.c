@@ -50,6 +50,147 @@ static struct mptcp_fm_ns *fm_get_ns(struct net *net)
 	return (struct mptcp_fm_ns *)net->mptcp.path_managers[MPTCP_PM_FULLMESH];
 }
 
+static void full_mesh_create_subflows(struct sock *meta_sk);
+
+static void retry_subflow_worker(struct work_struct *work)
+{
+	struct delayed_work *delayed_work = container_of(work,
+							 struct delayed_work,
+							 work);
+	struct fullmesh_priv *pm_priv = container_of(delayed_work,
+						     struct fullmesh_priv,
+						     subflow_retry_work);
+	struct mptcp_cb *mpcb = pm_priv->mpcb;
+	struct sock *meta_sk = mpcb->meta_sk;
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(meta_sk));
+	int iter = 0, i;
+
+	/* We need a local (stable) copy of the address-list. Really, it is not
+	 * such a big deal, if the address-list is not 100% up-to-date.
+	 */
+	rcu_read_lock_bh();
+	mptcp_local = rcu_dereference_bh(fm_ns->local);
+	mptcp_local = kmemdup(mptcp_local, sizeof(*mptcp_local), GFP_ATOMIC);
+	rcu_read_unlock_bh();
+
+	if (!mptcp_local)
+		return;
+
+next_subflow:
+	if (iter) {
+		release_sock(meta_sk);
+		mutex_unlock(&mpcb->mpcb_mutex);
+
+		yield();
+	}
+	mutex_lock(&mpcb->mpcb_mutex);
+	lock_sock_nested(meta_sk, SINGLE_DEPTH_NESTING);
+
+	iter++;
+
+	if (sock_flag(meta_sk, SOCK_DEAD))
+		goto exit;
+
+	mptcp_for_each_bit_set(mpcb->rem4_bits, i) {
+		struct mptcp_rem4 *rem = &mpcb->remaddr4[i];
+		/* Do we need to retry establishing a subflow ? */
+		if (rem->retry_bitfield) {
+			int i = mptcp_find_free_index(~rem->retry_bitfield);
+			mptcp_init4_subsockets(meta_sk, &mptcp_local->locaddr4[i], rem);
+			rem->retry_bitfield &= ~(1 << i);
+			goto next_subflow;
+		}
+	}
+
+	kfree(mptcp_local);
+
+exit:
+	release_sock(meta_sk);
+	mutex_unlock(&mpcb->mpcb_mutex);
+	sock_put(meta_sk);
+}
+
+/**
+ * Create all new subflows, by doing calls to mptcp_initX_subsockets
+ *
+ * This function uses a goto next_subflow, to allow releasing the lock between
+ * new subflows and giving other processes a chance to do some work on the
+ * socket and potentially finishing the communication.
+ **/
+static void create_subflow_worker(struct work_struct *work)
+{
+	struct fullmesh_priv *pm_priv = container_of(work,
+						     struct fullmesh_priv,
+						     subflow_work);
+	struct mptcp_cb *mpcb = pm_priv->mpcb;
+	struct sock *meta_sk = mpcb->meta_sk;
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(meta_sk));
+	int iter = 0, retry = 0;
+	int i;
+
+	/* We need a local (stable) copy of the address-list. Really, it is not
+	 * such a big deal, if the address-list is not 100% up-to-date.
+	 */
+	rcu_read_lock_bh();
+	mptcp_local = rcu_dereference_bh(fm_ns->local);
+	mptcp_local = kmemdup(mptcp_local, sizeof(*mptcp_local), GFP_ATOMIC);
+	rcu_read_unlock_bh();
+
+	if (!mptcp_local)
+		return;
+
+next_subflow:
+	if (iter) {
+		release_sock(meta_sk);
+		mutex_unlock(&mpcb->mpcb_mutex);
+
+		yield();
+	}
+	mutex_lock(&mpcb->mpcb_mutex);
+	lock_sock_nested(meta_sk, SINGLE_DEPTH_NESTING);
+
+	iter++;
+
+	if (sock_flag(meta_sk, SOCK_DEAD))
+		goto exit;
+
+	if (mpcb->master_sk &&
+	    !tcp_sk(mpcb->master_sk)->mptcp->fully_established)
+		goto exit;
+
+	mptcp_for_each_bit_set(mpcb->rem4_bits, i) {
+		struct mptcp_rem4 *rem;
+		u8 remaining_bits;
+
+		rem = &mpcb->remaddr4[i];
+		remaining_bits = ~(rem->bitfield) & mptcp_local->loc4_bits;
+
+		/* Are there still combinations to handle? */
+		if (remaining_bits) {
+			int i = mptcp_find_free_index(~remaining_bits);
+			/* If a route is not yet available then retry once */
+			if (mptcp_init4_subsockets(meta_sk, &mptcp_local->locaddr4[i],
+						   rem) == -ENETUNREACH)
+				retry = rem->retry_bitfield |= (1 << i);
+			goto next_subflow;
+		}
+	}
+
+	if (retry && !delayed_work_pending(&pm_priv->subflow_retry_work)) {
+		sock_hold(meta_sk);
+		queue_delayed_work(mptcp_wq, &pm_priv->subflow_retry_work,
+				   msecs_to_jiffies(MPTCP_SUBFLOW_RETRY_DELAY));
+	}
+
+exit:
+	kfree(mptcp_local);
+	release_sock(meta_sk);
+	mutex_unlock(&mpcb->mpcb_mutex);
+	sock_put(meta_sk);
+}
+
 static int mptcp_find_address(struct mptcp_loc_addr *mptcp_local,
 			      struct mptcp_addr_event *event)
 {
@@ -196,6 +337,8 @@ duno:
 				sk = mptcp_select_ack_sock(meta_sk, 0);
 				if (sk)
 					tcp_send_ack(sk);
+
+				full_mesh_create_subflows(meta_sk);
 			}
 next:
 			bh_unlock_sock(meta_sk);
@@ -333,6 +476,8 @@ static void full_mesh_new_session(struct sock *meta_sk, u8 id)
 	int i;
 
 	/* Initialize workqueue-struct */
+	INIT_WORK(&fmp->subflow_work, create_subflow_worker);
+	INIT_DELAYED_WORK(&fmp->subflow_retry_work, retry_subflow_worker);
 	fmp->mpcb = mpcb;
 
 	sk = mptcp_select_ack_sock(meta_sk, 0);
@@ -364,6 +509,26 @@ static void full_mesh_new_session(struct sock *meta_sk, u8 id)
 
 static void full_mesh_create_subflows(struct sock *meta_sk)
 {
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct fullmesh_priv *pm_priv = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
+
+	if (mpcb->infinite_mapping_snd || mpcb->infinite_mapping_rcv ||
+	    mpcb->send_infinite_mapping ||
+	    mpcb->server_side || sock_flag(meta_sk, SOCK_DEAD))
+		return;
+
+	/* The master may not yet be fully established (address added through
+	 * mptcp_update_metasocket). Then, we should not attempt to create new
+	 * subflows.
+	 */
+	if (mpcb->master_sk &&
+	    !tcp_sk(mpcb->master_sk)->mptcp->fully_established)
+		return;
+
+	if (!work_pending(&pm_priv->subflow_work)) {
+		sock_hold(meta_sk);
+		queue_work(mptcp_wq, &pm_priv->subflow_work);
+	}
 }
 
 /* Called upon release_sock, if the socket was owned by the user during
@@ -403,6 +568,7 @@ static void full_mesh_release_sock(struct sock *meta_sk)
 			sk = mptcp_select_ack_sock(meta_sk, 0);
 			if (sk)
 				tcp_send_ack(sk);
+			full_mesh_create_subflows(meta_sk);
 		}
 	}
 	rcu_read_unlock();

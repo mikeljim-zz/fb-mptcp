@@ -2979,6 +2979,19 @@ void tcp_connect_init(struct sock *sk)
 		if (is_master_tp(tp)) {
 			tp->request_mptcp = 1;
 			mptcp_connect_init(sk);
+		} else if (tp->mptcp) {
+			struct inet_sock *inet	= inet_sk(sk);
+
+			tp->mptcp->snt_isn	= tp->write_seq;
+			tp->mptcp->init_rcv_wnd	= tp->rcv_wnd;
+
+			/* Set nonce for new subflows */
+			tp->mptcp->mptcp_loc_nonce = mptcp_v4_get_nonce(
+							inet->inet_saddr,
+							inet->inet_daddr,
+							inet->inet_sport,
+							inet->inet_dport,
+							tp->write_seq);
 		}
 	}
 #endif

@@ -1580,6 +1580,17 @@ static inline int mptcp_mp_fail_rcvd(struct sock *sk, const struct tcphdr *th)
 	return 0;
 }
 
+static inline void mptcp_path_array_check(struct sock *meta_sk)
+{
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+
+	if (unlikely(mpcb->list_rcvd)) {
+		mpcb->list_rcvd = 0;
+		if (mpcb->pm_ops->new_remote_address)
+			mpcb->pm_ops->new_remote_address(meta_sk);
+	}
+}
+
 int mptcp_handle_options(struct sock *sk, const struct tcphdr *th, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -1618,6 +1629,7 @@ int mptcp_handle_options(struct sock *sk, const struct tcphdr *th, struct sk_buf
 
 	mptcp_data_ack(sk, skb);
 
+	mptcp_path_array_check(mptcp_meta_sk(sk));
 	/* Socket may have been mp_killed by a REMOVE_ADDR */
 	if (tp->mp_killed)
 		return 1;

@@ -986,7 +986,12 @@ int mptcp_add_sock(struct sock *meta_sk, struct sock *sk, u8 loc_id, u8 rem_id,
 	if (!tp->mptcp)
 		return -ENOMEM;
 
-	tp->mptcp->path_index = 1;
+	tp->mptcp->path_index = mptcp_set_new_pathindex(mpcb);
+	/* No more space for more subflows? */
+	if (!tp->mptcp->path_index) {
+		kmem_cache_free(mptcp_sock_cache, tp->mptcp);
+		return -EPERM;
+	}
 
 	INIT_LIST_HEAD(&tp->mptcp->cb_list);
 
@@ -1055,6 +1060,7 @@ void mptcp_del_sock(struct sock *sk)
 
 	tp->mptcp->next = NULL;
 	tp->mptcp->attached = 0;
+	mpcb->path_index_bits &= ~(1 << tp->mptcp->path_index);
 
 	if (!skb_queue_empty(&sk->sk_write_queue))
 		mptcp_reinject_data(sk, 0);
