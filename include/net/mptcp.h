@@ -350,6 +350,7 @@ extern bool mptcp_init_failed;
 #define OPTION_TYPE_ACK		(1 << 2)
 #define OPTION_MP_CAPABLE	(1 << 3)
 #define OPTION_DATA_ACK		(1 << 4)
+#define OPTION_ADD_ADDR		(1 << 5)
 #define OPTION_MP_JOIN		(1 << 6)
 #define OPTION_MP_FAIL		(1 << 7)
 #define OPTION_MP_FCLOSE	(1 << 8)

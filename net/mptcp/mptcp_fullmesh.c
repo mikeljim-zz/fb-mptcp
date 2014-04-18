@@ -432,6 +432,49 @@ static int full_mesh_get_local_id(sa_family_t family, union inet_addr *addr,
 	return id;
 }
 
+static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
+				  struct tcp_out_options *opts,
+				  struct sk_buff *skb)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct fullmesh_priv *fmp = (struct fullmesh_priv *)&mpcb->mptcp_pm[0];
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(sk));
+	u8 unannouncedv4;
+
+	if (likely(!fmp->add_addr))
+		return;
+
+	rcu_read_lock();
+	mptcp_local = rcu_dereference(fm_ns->local);
+
+	/* IPv4 */
+	unannouncedv4 = (~fmp->announced_addrs_v4) & mptcp_local->loc4_bits;
+	if (unannouncedv4 &&
+	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN) {
+		int ind = mptcp_find_free_index(~unannouncedv4);
+
+		opts->options |= OPTION_MPTCP;
+		opts->mptcp_options |= OPTION_ADD_ADDR;
+		opts->add_addr4.addr_id = mptcp_local->locaddr4[ind].id;
+		opts->add_addr4.addr = mptcp_local->locaddr4[ind].addr;
+		opts->add_addr_v4 = 1;
+
+		if (skb) {
+			fmp->announced_addrs_v4 |= (1 << ind);
+			fmp->add_addr--;
+		}
+		*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN;
+	}
+
+	rcu_read_unlock();
+
+	if (!unannouncedv4 && skb) {
+		fmp->add_addr--;
+	}
+}
+
 static int mptcp_fm_init_net(struct net *net)
 {
 	struct mptcp_loc_addr *mptcp_local;
@@ -496,6 +539,7 @@ static struct mptcp_pm_ops full_mesh __read_mostly = {
 	.fully_established = full_mesh_create_subflows,
 	.new_remote_address = full_mesh_create_subflows,
 	.get_local_id = full_mesh_get_local_id,
+	.addr_signal = full_mesh_addr_signal,
 	.name = "fullmesh",
 	.owner = THIS_MODULE,
 };

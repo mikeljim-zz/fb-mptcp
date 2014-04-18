@@ -1453,6 +1453,19 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 		mpc->h = 1;
 	}
 
+	if (unlikely(OPTION_ADD_ADDR & opts->mptcp_options)) {
+		struct mp_add_addr *mpadd = (struct mp_add_addr *)ptr;
+
+		mpadd->kind = TCPOPT_MPTCP;
+		if (opts->add_addr_v4) {
+			mpadd->len = MPTCP_SUB_LEN_ADD_ADDR4;
+			mpadd->sub = MPTCP_SUB_ADD_ADDR;
+			mpadd->ipver = 4;
+			mpadd->addr_id = opts->add_addr4.addr_id;
+			mpadd->u.v4.addr = opts->add_addr4.addr;
+			ptr += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN >> 2;
+		}
+	}
 	if (unlikely(OPTION_MP_FAIL & opts->mptcp_options)) {
 		struct mp_fail *mpfail = (struct mp_fail *)ptr;
 

@@ -96,6 +96,10 @@ struct tcp_out_options {
 		} mp_capable;
 	};
 
+	struct {
+		struct in_addr addr;
+		u8 addr_id;
+	} add_addr4;
 #endif /* CONFIG_MPTCP */
 };
 
